@@ -123,7 +123,7 @@ export function TraitRulesManager({
       return match
     }
 
-    // Use existing property matching logic with better extraction
+    // Enhanced color matching with grouping
     const colors = [
       "red",
       "blue",
@@ -140,48 +140,103 @@ export function TraitRulesManager({
       "gray",
       "grey",
       "charcoal",
+      "silver",
+      "gold",
+      "violet",
+      "indigo",
+      "turquoise",
+      "lime",
+      "navy",
+      "maroon",
+      "olive",
     ]
 
+    const extractColor = (itemName: string) => {
+      const words = itemName
+        .toLowerCase()
+        .split(/[\s\-_]+/)
+        .filter((word) => word.length > 0)
+
+      // Find color words in the item name
+      const foundColors = words.filter((word) => colors.includes(word))
+
+      // If we found colors, return the first one
+      if (foundColors.length > 0) {
+        return foundColors[0]
+      }
+
+      // If no direct color match, check for partial matches
+      for (const word of words) {
+        for (const color of colors) {
+          if (word.includes(color) || color.includes(word)) {
+            return color
+          }
+        }
+      }
+
+      return null
+    }
+
+    if (property.toLowerCase() === "color") {
+      const sourceColor = extractColor(sourceItem.name)
+      console.log(`Source color extracted: "${sourceColor}"`)
+
+      if (!sourceColor) {
+        console.log(`No color found in source item "${sourceItem.name}"`)
+        return null
+      }
+
+      // Find ALL items with the same color
+      const matchingItems = targetItems.filter((item) => {
+        const targetColor = extractColor(item.name)
+        const matches =
+          sourceColor === targetColor ||
+          (sourceColor === "grey" && targetColor === "gray") ||
+          (sourceColor === "gray" && targetColor === "grey")
+
+        if (matches) {
+          console.log(`✅ Color match: "${sourceItem.name}" (${sourceColor}) → "${item.name}" (${targetColor})`)
+        }
+
+        return matches
+      })
+
+      console.log(
+        `Found ${matchingItems.length} matching items for color "${sourceColor}":`,
+        matchingItems.map((item) => item.name),
+      )
+
+      // Return a random item from the matching group
+      if (matchingItems.length > 0) {
+        const randomMatch = matchingItems[Math.floor(Math.random() * matchingItems.length)]
+        console.log(`Selected random match: "${randomMatch.name}"`)
+        return randomMatch
+      }
+
+      console.log(`❌ No color matches found for "${sourceColor}"`)
+      return null
+    }
+
+    // For other properties, use the existing logic but with better extraction
     const sourceWords = sourceItem.name
       .toLowerCase()
       .split(/[\s\-_]+/)
       .filter((word) => word.length > 0)
-    console.log(`Source words:`, sourceWords)
+    console.log(`Source words for property matching:`, sourceWords)
 
-    if (property.toLowerCase() === "color") {
-      const sourceColor = sourceWords.find((word) => colors.includes(word)) || sourceWords[0]
-      console.log(`Source color: "${sourceColor}"`)
-
-      const match = targetItems.find((item) => {
-        const targetWords = item.name
-          .toLowerCase()
-          .split(/[\s\-_]+/)
-          .filter((word) => word.length > 0)
-        const targetColor = targetWords.find((word) => colors.includes(word)) || targetWords[0]
-        console.log(`Comparing color "${sourceColor}" with "${targetColor}" for item "${item.name}"`)
-        return sourceColor === targetColor
-      })
-
-      console.log(`Color match found:`, match?.name || "None")
-      return match
-    }
-
-    // For other properties, look for the property word and the word after it
     const propertyIndex = sourceWords.findIndex((word) => word.includes(property.toLowerCase()))
     let sourceProperty
 
     if (propertyIndex >= 0) {
-      // If we found the property word, use the next word or the property word itself
       sourceProperty =
         propertyIndex < sourceWords.length - 1 ? sourceWords[propertyIndex + 1] : sourceWords[propertyIndex]
     } else {
-      // Fallback to first word
       sourceProperty = sourceWords[0]
     }
 
     console.log(`Source property "${property}": "${sourceProperty}"`)
 
-    const match = targetItems.find((item) => {
+    const matchingItems = targetItems.filter((item) => {
       const targetWords = item.name
         .toLowerCase()
         .split(/[\s\-_]+/)
@@ -198,12 +253,28 @@ export function TraitRulesManager({
         targetProperty = targetWords[0]
       }
 
-      console.log(`Comparing property "${sourceProperty}" with "${targetProperty}" for item "${item.name}"`)
-      return sourceProperty === targetProperty
+      const matches = sourceProperty === targetProperty
+      if (matches) {
+        console.log(`✅ Property match: "${sourceProperty}" → "${targetProperty}" (${item.name})`)
+      }
+
+      return matches
     })
 
-    console.log(`Property match found:`, match?.name || "None")
-    return match
+    console.log(
+      `Found ${matchingItems.length} matching items for property "${property}":`,
+      matchingItems.map((item) => item.name),
+    )
+
+    // Return a random item from the matching group
+    if (matchingItems.length > 0) {
+      const randomMatch = matchingItems[Math.floor(Math.random() * matchingItems.length)]
+      console.log(`Selected random match: "${randomMatch.name}"`)
+      return randomMatch
+    }
+
+    console.log(`❌ No property matches found for "${property}"`)
+    return null
   }
 
   const handleAddMatchingRule = () => {

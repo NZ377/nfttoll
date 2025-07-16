@@ -2,18 +2,18 @@
 
 import type React from "react"
 
-import { useState, useRef, useCallback } from "react"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useState, useRef, useCallback, useEffect } from "react"
 import { useToast } from "@/hooks/use-toast"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Label } from "@/components/ui/label"
+import { Input } from "@/components/ui/input"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { TraitRulesManager } from "@/components/trait-rules-manager"
 import { NFTPreview } from "@/components/nft-preview"
-import { ExportManager } from "@/components/export-manager"
-import { RarityAnalysis } from "@/components/rarity-analysis"
 import { TraitUsageStats } from "@/components/trait-usage-stats"
+import { RarityAnalysis } from "@/components/rarity-analysis"
+import { ExportManager } from "@/components/export-manager"
 
 interface LayerItem {
   id: number
@@ -68,7 +68,6 @@ interface ManualMapping {
   targetItemName: string
 }
 
-// At the top of the component, add a new interface for the project state
 interface ProjectState {
   layers: Layer[]
   traitMatchingRules: TraitMatchingRule[]
@@ -76,11 +75,36 @@ interface ProjectState {
   manualMappings: ManualMapping[]
   rarityMode: "equal" | "weighted"
   traitUsageStats: Record<string, Record<number, number>>
-  generatedCombinations: string[] // Store as array for JSON compatibility
+  generatedCombinations: string[]
   nextId: number
   nextRuleId: number
   nextExclusionId: number
   nextMappingId: number
+}
+
+interface BatchData {
+  combinations: Record<number, number>[]
+  batchNumber: number
+  collectionName: string
+  imageSize: number
+  startingNumber: number
+}
+
+interface ExportSession {
+  id: string
+  totalCount: number
+  batchSize: number
+  collectionName: string
+  imageSize: number
+  useRules: boolean
+  currentBatch: number
+  totalBatches: number
+  completedBatches: number[]
+  generatedCombinations: string[]
+  timestamp: number
+  status: "generating" | "ready" | "downloading" | "completed" | "paused"
+  currentBatchData?: BatchData
+  autoDownload: boolean
 }
 
 export default function NFTLayerViewer() {
@@ -93,6 +117,7 @@ export default function NFTLayerViewer() {
   const [exportProgress, setExportProgress] = useState(0)
   const [isExporting, setIsExporting] = useState(false)
   const [exportCancelled, setExportCancelled] = useState(false)
+
   const [uniquenessData, setUniquenessData] = useState<{
     totalCombinations: number
     uniquenessPercentage: number
@@ -114,11 +139,164 @@ export default function NFTLayerViewer() {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const workerRef = useRef<Worker | null>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
+  const progressIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   const [generatedCombinations, setGeneratedCombinations] = useState<Set<string>>(new Set())
+
+  // Enhanced batch export state with persistence
   const [batchExportMode, setBatchExportMode] = useState(false)
   const [currentBatch, setCurrentBatch] = useState(1)
   const [totalBatches, setTotalBatches] = useState(1)
+  const [batchStatus, setBatchStatus] = useState<"generating" | "ready" | "downloading" | "completed" | "paused">(
+    "generating",
+  )
+  const [completedBatches, setCompletedBatches] = useState<number[]>([])
+  const [currentBatchData, setCurrentBatchData] = useState<BatchData | null>(null)
+  const [exportConfig, setExportConfig] = useState<{
+    totalCount: number
+    batchSize: number
+    collectionName: string
+    imageSize: number
+    useRules: boolean
+  } | null>(null)
+  const [exportSession, setExportSession] = useState<ExportSession | null>(null)
+  const [autoDownload, setAutoDownload] = useState(false)
+  const [progressDetails, setProgressDetails] = useState<string>("")
+
+  // Session persistence functions
+  const saveExportSession = useCallback((session: ExportSession) => {
+    try {
+      localStorage.setItem("nft-export-session", JSON.stringify(session))
+      console.log("Export session saved:", session.id)
+    } catch (error) {
+      console.error("Failed to save export session:", error)
+    }
+  }, [])
+
+  const loadExportSession = useCallback((): ExportSession | null => {
+    try {
+      const saved = localStorage.getItem("nft-export-session")
+      if (saved) {
+        const session = JSON.parse(saved) as ExportSession
+        // Check if session is less than 24 hours old
+        if (Date.now() - session.timestamp < 24 * 60 * 60 * 1000) {
+          console.log("Export session loaded:", session.id)
+          return session
+        } else {
+          localStorage.removeItem("nft-export-session")
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load export session:", error)
+      localStorage.removeItem("nft-export-session")
+    }
+    return null
+  }, [])
+
+  const clearExportSession = useCallback(() => {
+    localStorage.removeItem("nft-export-session")
+    console.log("Export session cleared")
+  }, [])
+
+  // Load session on component mount
+  useEffect(() => {
+    const savedSession = loadExportSession()
+    if (savedSession && layers.length > 0) {
+      setExportSession(savedSession)
+      setExportConfig({
+        totalCount: savedSession.totalCount,
+        batchSize: savedSession.batchSize,
+        collectionName: savedSession.collectionName,
+        imageSize: savedSession.imageSize,
+        useRules: savedSession.useRules,
+      })
+      setBatchExportMode(true)
+      setCurrentBatch(savedSession.currentBatch)
+      setTotalBatches(savedSession.totalBatches)
+      setCompletedBatches(savedSession.completedBatches)
+      setBatchStatus(savedSession.status === "generating" ? "paused" : savedSession.status)
+      setCurrentBatchData(savedSession.currentBatchData || null)
+      setAutoDownload(savedSession.autoDownload || false)
+
+      // Restore generated combinations
+      setGeneratedCombinations(new Set(savedSession.generatedCombinations))
+
+      toast({
+        title: "Session Restored",
+        description: `Resumed export session: ${savedSession.collectionName} (Batch ${savedSession.currentBatch}/${savedSession.totalBatches})`,
+      })
+    }
+  }, [layers.length, loadExportSession, toast])
+
+  // Save session whenever it changes
+  useEffect(() => {
+    if (exportSession) {
+      saveExportSession(exportSession)
+    }
+  }, [exportSession, saveExportSession])
+
+  // Prevent page unload during export
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (batchExportMode && (batchStatus === "generating" || batchStatus === "downloading")) {
+        e.preventDefault()
+        e.returnValue = "NFT generation is in progress. Are you sure you want to leave?"
+        return "NFT generation is in progress. Are you sure you want to leave?"
+      }
+    }
+
+    window.addEventListener("beforeunload", handleBeforeUnload)
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload)
+  }, [batchExportMode, batchStatus])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current)
+      }
+      if (workerRef.current) {
+        workerRef.current.terminate()
+      }
+    }
+  }, [])
+
+  // Audio notification function
+  const playNotificationSound = useCallback(() => {
+    try {
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
+
+      const playBeep = (frequency: number, duration: number, delay: number) => {
+        setTimeout(() => {
+          const oscillator = audioContext.createOscillator()
+          const gainNode = audioContext.createGain()
+
+          oscillator.connect(gainNode)
+          gainNode.connect(audioContext.destination)
+
+          oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime)
+          oscillator.type = "sine"
+
+          gainNode.gain.setValueAtTime(0.3, audioContext.currentTime)
+          gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration)
+
+          oscillator.start(audioContext.currentTime)
+          oscillator.stop(audioContext.currentTime + duration)
+        }, delay)
+      }
+
+      // Play notification sequence
+      playBeep(800, 0.15, 0)
+      playBeep(1000, 0.15, 200)
+      playBeep(1200, 0.3, 400)
+    } catch (error) {
+      console.log("Audio notification not available:", error)
+    }
+  }, [])
 
   // Layer management functions
   const addLayer = useCallback(
@@ -486,86 +664,8 @@ export default function NFTLayerViewer() {
         return
       }
 
-      let matchingItem = null
-
-      if (rule.property === "name") {
-        // Extract the prefix before the dash or underscore
-        const sourcePrefix = sourceItem.name.split(/[-_]/)[0].toLowerCase().trim()
-        console.log(`🔤 Looking for name match with prefix: "${sourcePrefix}"`)
-
-        matchingItem = targetLayer.items.find((item) => {
-          const targetPrefix = item.name.split(/[-_]/)[0].toLowerCase().trim()
-          const matches = sourcePrefix === targetPrefix
-          console.log(`   Comparing "${sourcePrefix}" with "${targetPrefix}" (${item.name}): ${matches}`)
-          return matches
-        })
-      } else {
-        // Property-based matching
-        const colors = [
-          "red",
-          "blue",
-          "green",
-          "yellow",
-          "purple",
-          "orange",
-          "black",
-          "white",
-          "brown",
-          "pink",
-          "cyan",
-          "magenta",
-          "gray",
-          "grey",
-          "charcoal",
-        ]
-
-        const sourceWords = sourceItem.name
-          .toLowerCase()
-          .split(/[\s\-_]+/)
-          .filter((word) => word.length > 0)
-        console.log(`🔤 Source words for property matching:`, sourceWords)
-
-        if (rule.property.toLowerCase() === "color") {
-          const sourceColor = sourceWords.find((word) => colors.includes(word)) || sourceWords[0]
-          console.log(`🎨 Looking for color match: "${sourceColor}"`)
-
-          matchingItem = targetLayer.items.find((item) => {
-            const targetWords = item.name
-              .toLowerCase()
-              .split(/[\s\-_]+/)
-              .filter((word) => word.length > 0)
-            const targetColor = targetWords.find((word) => colors.includes(word)) || targetWords[0]
-            const matches = sourceColor === targetColor
-            console.log(`   Comparing color "${sourceColor}" with "${targetColor}" (${item.name}): ${matches}`)
-            return matches
-          })
-        } else {
-          // For other properties
-          const propertyIndex = sourceWords.findIndex((word) => word.includes(rule.property.toLowerCase()))
-          const sourceProperty =
-            propertyIndex >= 0 && propertyIndex < sourceWords.length - 1
-              ? sourceWords[propertyIndex + 1]
-              : sourceWords[0]
-
-          console.log(`🏷️ Looking for property "${rule.property}" match: "${sourceProperty}"`)
-
-          matchingItem = targetLayer.items.find((item) => {
-            const targetWords = item.name
-              .toLowerCase()
-              .split(/[\s\-_]+/)
-              .filter((word) => word.length > 0)
-            const targetPropertyIndex = targetWords.findIndex((word) => word.includes(rule.property.toLowerCase()))
-            const targetProperty =
-              targetPropertyIndex >= 0 && targetPropertyIndex < targetWords.length - 1
-                ? targetWords[targetPropertyIndex + 1]
-                : targetWords[0]
-
-            const matches = sourceProperty === targetProperty
-            console.log(`   Comparing property "${sourceProperty}" with "${targetProperty}" (${item.name}): ${matches}`)
-            return matches
-          })
-        }
-      }
+      // Use the improved findMatchingItem function
+      const matchingItem = findMatchingItem(sourceItem, targetLayer.items, rule.property)
 
       if (matchingItem) {
         console.log(`✅ MATCH FOUND: "${sourceItem.name}" → "${matchingItem.name}"`)
@@ -577,28 +677,68 @@ export default function NFTLayerViewer() {
           targetLayer.items.map((item) => item.name),
         )
 
-        // Try to find any valid item that won't violate exclusion rules
-        const validItems = targetLayer.items.filter((item) => {
-          return !traitExclusionRules.some((exclusionRule) => {
-            if (exclusionRule.sourceLayerId === sourceLayerId && exclusionRule.targetLayerId === rule.targetLayerId) {
-              if (exclusionRule.sourceItemId && exclusionRule.targetItemId) {
-                return exclusionRule.sourceItemId === sourceItemId && exclusionRule.targetItemId === item.id
-              } else if (exclusionRule.property) {
-                const sourceProp = extractProperty(sourceItem.name, exclusionRule.property)
-                const targetProp = extractProperty(item.name, exclusionRule.property)
-                return sourceProp.toLowerCase() === targetProp.toLowerCase()
-              }
-            }
-            return false
-          })
-        })
+        // For color matching, try a more lenient approach before falling back
+        if (rule.property.toLowerCase() === "color") {
+          console.log(`🔍 Trying lenient color matching as fallback...`)
 
-        if (validItems.length > 0) {
-          const fallbackItem = validItems[Math.floor(Math.random() * validItems.length)]
-          console.log(`🔄 Using fallback item: "${fallbackItem.name}"`)
-          selected[rule.targetLayerId] = fallbackItem.id
+          // Extract source color more aggressively
+          const sourceWords = sourceItem.name
+            .toLowerCase()
+            .split(/[\s\-_]+/)
+            .filter((word) => word.length > 0)
+          let fallbackColorMatch = null
+
+          // Try each word from source as potential color
+          for (const sourceWord of sourceWords) {
+            const colorMatches = targetLayer.items.filter((item) => {
+              const targetWords = item.name
+                .toLowerCase()
+                .split(/[\s\-_]+/)
+                .filter((word) => word.length > 0)
+              return targetWords.some(
+                (targetWord) =>
+                  targetWord === sourceWord || targetWord.includes(sourceWord) || sourceWord.includes(targetWord),
+              )
+            })
+
+            if (colorMatches.length > 0) {
+              fallbackColorMatch = colorMatches[Math.floor(Math.random() * colorMatches.length)]
+              console.log(
+                `🎨 Lenient color match found: "${sourceItem.name}" → "${fallbackColorMatch.name}" (via "${sourceWord}")`,
+              )
+              break
+            }
+          }
+
+          if (fallbackColorMatch) {
+            selected[rule.targetLayerId] = fallbackColorMatch.id
+          } else {
+            console.log(`⚠️ No color matches found even with lenient matching - skipping this rule`)
+          }
         } else {
-          console.log(`⚠️ No valid fallback items available`)
+          // For non-color properties, try to find any valid item that won't violate exclusion rules
+          const validItems = targetLayer.items.filter((item) => {
+            return !traitExclusionRules.some((exclusionRule) => {
+              if (exclusionRule.sourceLayerId === sourceLayerId && exclusionRule.targetLayerId === rule.targetLayerId) {
+                if (exclusionRule.sourceItemId && exclusionRule.targetItemId) {
+                  return exclusionRule.sourceItemId === sourceItemId && exclusionRule.targetItemId === item.id
+                } else if (exclusionRule.property) {
+                  const sourceProp = extractProperty(sourceItem.name, exclusionRule.property)
+                  const targetProp = extractProperty(item.name, exclusionRule.property)
+                  return sourceProp.toLowerCase() === targetProp.toLowerCase()
+                }
+              }
+              return false
+            })
+          })
+
+          if (validItems.length > 0) {
+            const fallbackItem = validItems[Math.floor(Math.random() * validItems.length)]
+            console.log(`🔄 Using fallback item: "${fallbackItem.name}"`)
+            selected[rule.targetLayerId] = fallbackItem.id
+          } else {
+            console.log(`⚠️ No valid fallback items available`)
+          }
         }
       }
     })
@@ -614,6 +754,159 @@ export default function NFTLayerViewer() {
       console.log(`👆 MANUAL MAPPING APPLIED: "${mapping.sourceItemName}" → "${mapping.targetItemName}"`)
       selected[mapping.targetLayerId] = mapping.targetItemId
     })
+  }
+
+  // Add the findMatchingItem function to the main component scope
+  const findMatchingItem = (sourceItem: any, targetItems: any[], property: string) => {
+    console.log(`Finding match for "${sourceItem.name}" using property "${property}"`)
+
+    if (property === "name") {
+      const sourcePrefix = sourceItem.name.split(/[-_]/)[0].toLowerCase().trim()
+      console.log(`Source prefix: "${sourcePrefix}"`)
+
+      const match = targetItems.find((item) => {
+        const targetPrefix = item.name.split(/[-_]/)[0].toLowerCase().trim()
+        const matches = sourcePrefix === targetPrefix
+        console.log(`   Comparing "${sourcePrefix}" with "${targetPrefix}" (${item.name}): ${matches}`)
+        return matches
+      })
+
+      console.log(`Match found:`, match?.name || "None")
+      return match
+    }
+
+    // Enhanced color matching with grouping
+    const colors = [
+      "red",
+      "blue",
+      "green",
+      "yellow",
+      "purple",
+      "orange",
+      "black",
+      "white",
+      "brown",
+      "pink",
+      "cyan",
+      "magenta",
+      "gray",
+      "grey",
+      "charcoal",
+      "silver",
+      "gold",
+      "violet",
+      "indigo",
+      "turquoise",
+      "lime",
+      "navy",
+      "maroon",
+      "olive",
+    ]
+
+    const extractColor = (itemName: string) => {
+      const words = itemName
+        .toLowerCase()
+        .split(/[\s\-_]+/)
+        .filter((word) => word.length > 0)
+
+      // Find color words in the item name
+      const foundColors = words.filter((word) => colors.includes(word))
+
+      if (foundColors.length > 0) {
+        return foundColors[0]
+      }
+
+      // Check for partial matches
+      for (const word of words) {
+        for (const color of colors) {
+          if (word.includes(color) || color.includes(word)) {
+            return color
+          }
+        }
+      }
+
+      return null
+    }
+
+    if (property.toLowerCase() === "color") {
+      const sourceColor = extractColor(sourceItem.name)
+      console.log(`🎨 Source color extracted: "${sourceColor}"`)
+
+      if (!sourceColor) {
+        console.log(`No color found in source item "${sourceItem.name}"`)
+        return null
+      }
+
+      // Find ALL items with the same color
+      const matchingItems = targetItems.filter((item) => {
+        const targetColor = extractColor(item.name)
+        const matches =
+          sourceColor === targetColor ||
+          (sourceColor === "grey" && targetColor === "gray") ||
+          (sourceColor === "gray" && targetColor === "grey")
+
+        if (matches) {
+          console.log(
+            `   ✅ Color group match: "${sourceItem.name}" (${sourceColor}) ↔ "${item.name}" (${targetColor})`,
+          )
+        }
+
+        return matches
+      })
+
+      console.log(
+        `🎨 Found ${matchingItems.length} items in ${sourceColor} color group:`,
+        matchingItems.map((item) => item.name),
+      )
+
+      // Return a random item from the matching color group
+      if (matchingItems.length > 0) {
+        const randomMatch = matchingItems[Math.floor(Math.random() * matchingItems.length)]
+        console.log(`🎲 Selected random match from color group: "${randomMatch.name}"`)
+        return randomMatch
+      }
+
+      return null
+    }
+
+    // For other properties
+    const sourceWords = sourceItem.name
+      .toLowerCase()
+      .split(/[\s\-_]+/)
+      .filter((word) => word.length > 0)
+    const propertyIndex = sourceWords.findIndex((word) => word.includes(property.toLowerCase()))
+    const sourceProperty =
+      propertyIndex >= 0 && propertyIndex < sourceWords.length - 1 ? sourceWords[propertyIndex + 1] : sourceWords[0]
+
+    console.log(`🏷️ Looking for property "${property}" match: "${sourceProperty}"`)
+
+    const matchingItems = targetItems.filter((item) => {
+      const targetWords = item.name
+        .toLowerCase()
+        .split(/[\s\-_]+/)
+        .filter((word) => word.length > 0)
+      const targetPropertyIndex = targetWords.findIndex((word) => word.includes(property.toLowerCase()))
+      const targetProperty =
+        targetPropertyIndex >= 0 && targetPropertyIndex < targetWords.length - 1
+          ? targetWords[targetPropertyIndex + 1]
+          : targetWords[0]
+
+      const matches = sourceProperty === targetProperty
+      if (matches) {
+        console.log(`   ✅ Property match: "${sourceProperty}" → "${targetProperty}" (${item.name})`)
+      }
+      return matches
+    })
+
+    // Return a random item from the matching group
+    if (matchingItems.length > 0) {
+      const randomMatch = matchingItems[Math.floor(Math.random() * matchingItems.length)]
+      console.log(`🎲 Selected random match: "${randomMatch.name}"`)
+      return randomMatch
+    }
+
+    console.log(`❌ No matches found for property "${property}"`)
+    return null
   }
 
   const [traitUsageStats, setTraitUsageStats] = useState<Record<string, Record<number, number>>>({})
@@ -1053,165 +1346,207 @@ export default function NFTLayerViewer() {
     return sortedKeys.map((key) => `${key}:${combination[Number(key)]}`).join("|")
   }
 
-  const generateAllUniqueCombinations = async (
-    exportCount: number,
+  // Enhanced batch generation with progress tracking and cancellation support
+  const generateBatchCombinations = async (
+    batchSize: number,
     useRules: boolean,
+    signal?: AbortSignal,
   ): Promise<Record<number, number>[]> => {
     const combinations: Record<number, number>[] = []
-    const generatedHashes = new Set<string>()
+    const batchHashes = new Set<string>()
+    const maxAttempts = batchSize * 15 // Increased attempts for better success rate
 
-    // Reset usage stats for export
-    setTraitUsageStats({})
+    let attempts = 0
+    let lastProgressUpdate = Date.now()
 
-    while (combinations.length < exportCount) {
+    while (combinations.length < batchSize && attempts < maxAttempts) {
+      // Check for cancellation
+      if (signal?.aborted) {
+        console.log("Batch generation cancelled")
+        throw new Error("Generation cancelled")
+      }
+
+      attempts++
+
+      // Update progress more frequently and with details
+      const now = Date.now()
+      if (now - lastProgressUpdate > 100) {
+        // Update every 100ms
+        const progress = Math.round((combinations.length / batchSize) * 100)
+        setExportProgress(progress)
+        setProgressDetails(`Generated ${combinations.length} of ${batchSize} NFTs (${attempts} attempts)`)
+        lastProgressUpdate = now
+      }
+
       let combination: Record<number, number>
 
-      if (useRules) {
-        combination = generateValidCombination(true) // Use balancing
-      } else {
-        combination = generateRandomCombination(true) // Use balancing
+      try {
+        if (useRules) {
+          combination = generateValidCombination(true)
+        } else {
+          combination = generateRandomCombination(true)
+        }
+
+        const hash = createCombinationHash(combination)
+
+        // Check against both batch duplicates and global duplicates
+        if (!batchHashes.has(hash) && !generatedCombinations.has(hash)) {
+          combinations.push(combination)
+          batchHashes.add(hash)
+          updateTraitUsage(combination)
+        }
+      } catch (error) {
+        console.warn("Error generating combination:", error)
+        continue
       }
 
-      const hash = createCombinationHash(combination)
-
-      if (!generatedHashes.has(hash)) {
-        combinations.push(combination)
-        generatedHashes.add(hash)
-
-        // Update usage stats during generation
-        updateTraitUsage(combination)
-      } else {
-        console.log("Duplicate combination found, regenerating...")
-      }
-
-      if (generatedHashes.size > 2 * exportCount) {
-        console.warn("Reached maximum attempts to generate unique combinations. Stopping generation.")
-        break
+      // Yield control periodically to prevent freezing
+      if (attempts % 25 === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1))
       }
     }
 
+    // Update global generated combinations
+    setGeneratedCombinations((prev) => new Set([...prev, ...batchHashes]))
+
+    console.log(`Generated ${combinations.length} combinations in ${attempts} attempts`)
     return combinations
   }
 
-  const clearTraitUsageStats = useCallback(() => {
-    setTraitUsageStats({})
-    toast({
-      title: "Success",
-      description: "Trait usage statistics cleared. All traits will have equal priority again.",
-    })
-  }, [toast])
-
-  const exportBatchWithCombinations = async (
-    batchCombinations: Record<number, number>[],
-    batchName: string,
-    imageSize: number,
-    batchIndex: number,
-    startingNumber: number,
-  ) => {
-    const { default: JSZip } = await import("jszip")
-    const zip = new JSZip()
-    const imagesFolder = zip.folder("images")
-    const metadataFolder = zip.folder("metadata")
-
-    setIsExporting(true)
+  // Enhanced download function with better progress tracking
+  const downloadBatch = async (batchData: BatchData) => {
+    setBatchStatus("downloading")
     setExportProgress(0)
+    setProgressDetails("Initializing download...")
 
-    console.log(
-      `Starting export of batch ${batchIndex} with ${batchCombinations.length} NFTs starting from #${startingNumber}`,
-    )
+    // Create abort controller for this download
+    const abortController = new AbortController()
+    abortControllerRef.current = abortController
 
-    for (let i = 0; i < batchCombinations.length; i++) {
-      if (exportCancelled) break
+    try {
+      const { default: JSZip } = await import("jszip")
+      const zip = new JSZip()
+      const imagesFolder = zip.folder("images")
+      const metadataFolder = zip.folder("metadata")
 
-      const progress = Math.round((i / batchCombinations.length) * 90)
-      setExportProgress(progress)
+      console.log(`Creating ZIP for batch ${batchData.batchNumber} with ${batchData.combinations.length} NFTs`)
 
-      const combination = batchCombinations[i]
-      const nftNumber = startingNumber + i
-
-      try {
-        const canvas = document.createElement("canvas")
-        canvas.width = imageSize
-        canvas.height = imageSize
-        const ctx = canvas.getContext("2d", {
-          alpha: false,
-          willReadFrequently: false,
-        })!
-
-        ctx.fillStyle = "white"
-        ctx.fillRect(0, 0, imageSize, imageSize)
-
-        const sortedLayers = layers.filter((layer) => combination[layer.id]).sort((a, b) => a.zIndex - b.zIndex)
-
-        for (const layer of sortedLayers) {
-          const itemId = combination[layer.id]
-          const item = layer.items.find((i) => i.id === itemId)
-          if (!item) continue
-
-          await new Promise<void>((resolve, reject) => {
-            const img = new Image()
-            img.onload = () => {
-              try {
-                ctx.drawImage(img, 0, 0, imageSize, imageSize)
-                resolve()
-              } catch (error) {
-                reject(error)
-              }
-            }
-            img.onerror = () => reject(new Error(`Failed to load image for ${item.name}`))
-            img.crossOrigin = "anonymous"
-            img.src = item.dataUrl
-          })
+      for (let i = 0; i < batchData.combinations.length; i++) {
+        if (abortController.signal.aborted) {
+          throw new Error("Download cancelled")
         }
 
-        const blob = await new Promise<Blob>((resolve) => {
-          canvas.toBlob((blob) => resolve(blob!), "image/png", 0.9)
-        })
+        // Update progress during NFT generation (0-80%)
+        const nftProgress = Math.round((i / batchData.combinations.length) * 80)
+        setExportProgress(nftProgress)
+        setProgressDetails(`Generating NFT ${i + 1} of ${batchData.combinations.length}...`)
 
-        imagesFolder?.file(`${nftNumber}.png`, blob)
+        const combination = batchData.combinations[i]
+        const nftNumber = batchData.startingNumber + i
 
-        const metadata = {
-          name: `${batchName.replace(/ - Batch \d+/, "")} #${nftNumber}`,
-          description: `A unique NFT from the ${batchName.replace(/ - Batch \d+/, "")} collection`,
-          created_by: "",
-          image: `ipfs://[CID]/images/${nftNumber}.png`,
-          attributes: sortedLayers.map((layer) => {
+        try {
+          // Create canvas with optimized settings
+          const canvas = document.createElement("canvas")
+          canvas.width = batchData.imageSize
+          canvas.height = batchData.imageSize
+          const ctx = canvas.getContext("2d", {
+            alpha: false,
+            willReadFrequently: false,
+            desynchronized: true, // Better performance
+          })!
+
+          ctx.fillStyle = "white"
+          ctx.fillRect(0, 0, batchData.imageSize, batchData.imageSize)
+
+          const sortedLayers = layers.filter((layer) => combination[layer.id]).sort((a, b) => a.zIndex - b.zIndex)
+
+          // Load and draw images with better error handling
+          for (const layer of sortedLayers) {
             const itemId = combination[layer.id]
             const item = layer.items.find((i) => i.id === itemId)
-            return {
-              trait_type: layer.name,
-              value: item?.name || "Unknown",
-            }
-          }),
+            if (!item) continue
+
+            await new Promise<void>((resolve, reject) => {
+              const img = new Image()
+              const timeout = setTimeout(() => {
+                reject(new Error(`Timeout loading image for ${item.name}`))
+              }, 10000) // 10 second timeout
+
+              img.onload = () => {
+                clearTimeout(timeout)
+                try {
+                  ctx.drawImage(img, 0, 0, batchData.imageSize, batchData.imageSize)
+                  resolve()
+                } catch (error) {
+                  reject(error)
+                }
+              }
+              img.onerror = () => {
+                clearTimeout(timeout)
+                reject(new Error(`Failed to load image for ${item.name}`))
+              }
+              img.crossOrigin = "anonymous"
+              img.src = item.dataUrl
+            })
+          }
+
+          // Convert to blob with optimized quality
+          const blob = await new Promise<Blob>((resolve) => {
+            canvas.toBlob((blob) => resolve(blob!), "image/png", 0.8) // Reduced quality for speed
+          })
+
+          imagesFolder?.file(`${nftNumber}.png`, blob)
+
+          const metadata = {
+            name: `${batchData.collectionName} #${nftNumber}`,
+            description: `A unique NFT from the ${batchData.collectionName} collection`,
+            created_by: "",
+            image: `ipfs://[CID]/images/${nftNumber}.png`,
+            attributes: sortedLayers.map((layer) => {
+              const itemId = combination[layer.id]
+              const item = layer.items.find((i) => i.id === itemId)
+              return {
+                trait_type: layer.name,
+                value: item?.name || "Unknown",
+              }
+            }),
+          }
+
+          metadataFolder?.file(`${nftNumber}.json`, JSON.stringify(metadata, null, 2))
+
+          // Clean up canvas
+          canvas.width = 1
+          canvas.height = 1
+
+          // Yield control every 5 NFTs
+          if (i % 5 === 0 && i > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 10))
+          }
+        } catch (error) {
+          console.error(`Error generating NFT ${nftNumber}:`, error)
+          // Continue with next NFT instead of failing entire batch
         }
-
-        metadataFolder?.file(`${nftNumber}.json`, JSON.stringify(metadata, null, 2))
-
-        canvas.width = 1
-        canvas.height = 1
-
-        if (i % 5 === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 5))
-        }
-      } catch (error) {
-        console.error(`Error generating NFT ${nftNumber}:`, error)
       }
-    }
 
-    if (!exportCancelled) {
-      console.log(`Finished generating ${batchCombinations.length} NFTs, starting ZIP creation...`)
-      setExportProgress(92)
+      if (abortController.signal.aborted) {
+        throw new Error("Download cancelled")
+      }
 
-      const endNumber = startingNumber + batchCombinations.length - 1
+      // Update progress for ZIP creation (80-95%)
+      setExportProgress(82)
+      setProgressDetails("Preparing ZIP file...")
+      console.log(`Finished generating ${batchData.combinations.length} NFTs, starting ZIP creation...`)
+
+      const endNumber = batchData.startingNumber + batchData.combinations.length - 1
 
       zip.file(
         "README.txt",
-        `NFT Collection: ${batchName}
+        `NFT Collection: ${batchData.collectionName}
 Generated on: ${new Date().toLocaleString()}
-Total NFTs: ${batchCombinations.length}
-NFT Numbers: ${startingNumber} to ${endNumber}
-Image Size: ${imageSize}x${imageSize}px
-Batch Number: ${batchIndex}
+Batch: ${batchData.batchNumber}
+Total NFTs in batch: ${batchData.combinations.length}
+NFT Numbers: ${batchData.startingNumber} to ${endNumber}
+Image Size: ${batchData.imageSize}x${batchData.imageSize}px
 
 ⚠️ IMPORTANT: This is part of a larger collection split into batches.
 All NFTs across all batches are guaranteed to be unique.
@@ -1224,59 +1559,352 @@ IPFS Instructions:
 5. Use the metadata folder CID for your NFT contract`,
       )
 
-      setExportProgress(94)
+      setExportProgress(85)
+      setProgressDetails("Creating ZIP file...")
       console.log("Creating ZIP file...")
 
-      try {
-        const zipContent = await zip.generateAsync(
-          {
-            type: "blob",
-            compression: "DEFLATE",
-            compressionOptions: { level: 1 },
-            streamFiles: true,
-          },
-          (metadata) => {
-            const zipProgress = 94 + metadata.percent * 0.04
-            setExportProgress(Math.round(zipProgress))
-            console.log(`ZIP generation progress: ${metadata.percent.toFixed(1)}%`)
-          },
-        )
+      const zipContent = await zip.generateAsync(
+        {
+          type: "blob",
+          compression: "STORE", // No compression for speed
+          streamFiles: false, // Disable streaming for faster generation
+        },
+        (metadata) => {
+          // Update progress during ZIP creation (85-98%)
+          const zipProgress = 85 + metadata.percent * 0.13
+          setExportProgress(Math.round(zipProgress))
+          setProgressDetails(`Creating ZIP file... ${metadata.percent.toFixed(1)}%`)
+        },
+      )
 
-        setExportProgress(99)
-        console.log("ZIP created, starting download...")
+      setExportProgress(99)
+      setProgressDetails("Starting download...")
+      console.log("ZIP created, starting download...")
 
-        const url = URL.createObjectURL(zipContent)
-        const a = document.createElement("a")
-        a.href = url
-        a.download = `${batchName.toLowerCase().replace(/\s+/g, "-")}-nfts-${startingNumber}-${endNumber}.zip`
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
+      const url = URL.createObjectURL(zipContent)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `${batchData.collectionName.toLowerCase().replace(/\s+/g, "-")}-batch-${batchData.batchNumber}-nfts-${batchData.startingNumber}-${endNumber}.zip`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
 
-        setExportProgress(100)
-        console.log(`Batch ${batchIndex} download initiated`)
+      setTimeout(() => {
+        URL.revokeObjectURL(url)
+      }, 5000)
 
+      // Update session state
+      const updatedCompletedBatches = [...completedBatches, batchData.batchNumber]
+      setCompletedBatches(updatedCompletedBatches)
+      setBatchStatus("completed")
+      setExportProgress(100)
+      setProgressDetails("Download completed!")
+
+      // Update export session
+      if (exportSession) {
+        const updatedSession: ExportSession = {
+          ...exportSession,
+          completedBatches: updatedCompletedBatches,
+          status: currentBatch >= totalBatches ? "completed" : "completed",
+          generatedCombinations: Array.from(generatedCombinations),
+          timestamp: Date.now(),
+        }
+        setExportSession(updatedSession)
+      }
+
+      // Play notification sound
+      playNotificationSound()
+
+      toast({
+        title: "Success",
+        description: `Batch ${batchData.batchNumber} downloaded successfully! (NFTs ${batchData.startingNumber}-${endNumber})`,
+      })
+
+      // Auto-continue to next batch if enabled and not the last batch
+      if (autoDownload && currentBatch < totalBatches) {
         setTimeout(() => {
-          URL.revokeObjectURL(url)
-          console.log(`Cleaned up URL for batch ${batchIndex}`)
-        }, 5000)
-
+          generateNextBatch()
+        }, 2000) // 2 second delay before next batch
+      }
+    } catch (error) {
+      console.error("Download error:", error)
+      if (error instanceof Error && error.message === "Download cancelled") {
+        setBatchStatus("ready")
+        setProgressDetails("Download cancelled")
         toast({
-          title: "Success",
-          description: `Batch ${batchIndex} with NFTs ${startingNumber}-${endNumber} exported successfully!`,
-        })
-      } catch (zipError) {
-        console.error("ZIP generation failed:", zipError)
-        toast({
-          title: "Error",
-          description: `Failed to create ZIP for batch ${batchIndex}: ${zipError}`,
+          title: "Cancelled",
+          description: "Download was cancelled",
           variant: "destructive",
         })
+      } else {
+        toast({
+          title: "Error",
+          description: `Failed to download batch ${batchData.batchNumber}: ${error}`,
+          variant: "destructive",
+        })
+        setBatchStatus("ready") // Reset to ready state on error
       }
+    } finally {
+      abortControllerRef.current = null
+    }
+  }
+
+  const generateNextBatch = async () => {
+    if (!exportConfig) return
+
+    const nextBatchNumber = currentBatch + 1
+    const remainingNFTs = exportConfig.totalCount - completedBatches.length * exportConfig.batchSize
+    const currentBatchSize = Math.min(exportConfig.batchSize, remainingNFTs)
+    const startingNumber = (nextBatchNumber - 1) * exportConfig.batchSize + 1
+
+    setCurrentBatch(nextBatchNumber)
+    setBatchStatus("generating")
+    setExportProgress(0)
+    setProgressDetails("Starting batch generation...")
+
+    console.log(`Generating batch ${nextBatchNumber} with ${currentBatchSize} NFTs`)
+
+    // Create abort controller for this generation
+    const abortController = new AbortController()
+    abortControllerRef.current = abortController
+
+    // Update export session
+    if (exportSession) {
+      const updatedSession: ExportSession = {
+        ...exportSession,
+        currentBatch: nextBatchNumber,
+        status: "generating",
+        timestamp: Date.now(),
+      }
+      setExportSession(updatedSession)
     }
 
-    setIsExporting(false)
-    setExportProgress(0)
+    try {
+      const combinations = await generateBatchCombinations(
+        currentBatchSize,
+        exportConfig.useRules,
+        abortController.signal,
+      )
+
+      if (combinations.length === 0) {
+        toast({
+          title: "Error",
+          description: `Could not generate enough unique combinations for batch ${nextBatchNumber}`,
+          variant: "destructive",
+        })
+        setBatchExportMode(false)
+        clearExportSession()
+        return
+      }
+
+      const batchData: BatchData = {
+        combinations,
+        batchNumber: nextBatchNumber,
+        collectionName: exportConfig.collectionName,
+        imageSize: exportConfig.imageSize,
+        startingNumber,
+      }
+
+      setCurrentBatchData(batchData)
+      setBatchStatus("ready")
+      setExportProgress(100)
+      setProgressDetails(`Batch ${nextBatchNumber} ready for download`)
+
+      // Update export session with batch data
+      const updatedSession: ExportSession = {
+        ...exportSession,
+        status: "ready",
+        currentBatchData: batchData,
+        generatedCombinations: Array.from(generatedCombinations),
+        timestamp: Date.now(),
+      }
+      setExportSession(updatedSession)
+
+      toast({
+        title: "Batch Ready",
+        description: `Batch ${nextBatchNumber} generated successfully with ${combinations.length} unique NFTs!`,
+      })
+
+      // Auto-download if enabled
+      if (autoDownload) {
+        setTimeout(() => {
+          downloadBatch(batchData)
+        }, 1000) // 1 second delay before auto-download
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === "Generation cancelled") {
+        console.log("Batch generation was cancelled")
+        return
+      }
+
+      console.error("Batch generation error:", error)
+      toast({
+        title: "Error",
+        description: `Failed to generate batch ${nextBatchNumber}: ${error}`,
+        variant: "destructive",
+      })
+      setBatchExportMode(false)
+      clearExportSession()
+    } finally {
+      abortControllerRef.current = null
+    }
+  }
+
+  const startBatchExport = async (
+    exportCount: number,
+    collectionName: string,
+    imageSize: number,
+    useRules: boolean,
+    batchSize: number,
+    splitIntoMultiple = false,
+  ) => {
+    if (layers.length === 0) {
+      toast({
+        title: "Error",
+        description: "No layers added yet",
+        variant: "destructive",
+      })
+      return
+    }
+
+    const totalPossibleCombinations = layers.reduce((total, layer) => total * layer.items.length, 1)
+
+    if (exportCount > totalPossibleCombinations) {
+      toast({
+        title: "Warning",
+        description: `Requested ${exportCount} NFTs but only ${totalPossibleCombinations} unique combinations possible. Reducing to maximum possible.`,
+        variant: "destructive",
+      })
+      exportCount = totalPossibleCombinations
+    }
+
+    if (splitIntoMultiple) {
+      // Start batch export mode
+      const numBatches = Math.ceil(exportCount / batchSize)
+      const sessionId = `export-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+      const newExportConfig = {
+        totalCount: exportCount,
+        batchSize,
+        collectionName,
+        imageSize,
+        useRules,
+      }
+
+      const newExportSession: ExportSession = {
+        id: sessionId,
+        totalCount: exportCount,
+        batchSize,
+        collectionName,
+        imageSize,
+        useRules,
+        currentBatch: 1,
+        totalBatches: numBatches,
+        completedBatches: [],
+        generatedCombinations: Array.from(generatedCombinations),
+        timestamp: Date.now(),
+        status: "generating",
+        autoDownload: false,
+      }
+
+      setExportConfig(newExportConfig)
+      setExportSession(newExportSession)
+      setBatchExportMode(true)
+      setTotalBatches(numBatches)
+      setCurrentBatch(1)
+      setCompletedBatches([])
+      setBatchStatus("generating")
+      setExportProgress(0)
+      setExportCancelled(false)
+      setProgressDetails("Starting first batch generation...")
+
+      console.log(`Starting batch export: ${exportCount} NFTs in ${numBatches} batches of ${batchSize} each`)
+
+      // Create abort controller for first batch
+      const abortController = new AbortController()
+      abortControllerRef.current = abortController
+
+      // Generate first batch
+      try {
+        const firstBatchSize = Math.min(batchSize, exportCount)
+        const combinations = await generateBatchCombinations(firstBatchSize, useRules, abortController.signal)
+
+        if (combinations.length === 0) {
+          toast({
+            title: "Error",
+            description: "Could not generate enough unique combinations for first batch",
+            variant: "destructive",
+          })
+          setBatchExportMode(false)
+          clearExportSession()
+          return
+        }
+
+        const batchData: BatchData = {
+          combinations,
+          batchNumber: 1,
+          collectionName,
+          imageSize,
+          startingNumber: 1,
+        }
+
+        setCurrentBatchData(batchData)
+        setBatchStatus("ready")
+        setExportProgress(100)
+        setProgressDetails("First batch ready for download")
+
+        // Update session with first batch data
+        const updatedSession: ExportSession = {
+          ...newExportSession,
+          status: "ready",
+          currentBatchData: batchData,
+          generatedCombinations: Array.from(generatedCombinations),
+        }
+        setExportSession(updatedSession)
+
+        toast({
+          title: "First Batch Ready",
+          description: `Batch 1 generated successfully with ${combinations.length} unique NFTs!`,
+        })
+      } catch (error) {
+        if (error instanceof Error && error.message === "Generation cancelled") {
+          console.log("First batch generation was cancelled")
+          return
+        }
+
+        console.error("First batch generation error:", error)
+        toast({
+          title: "Error",
+          description: `Failed to generate first batch: ${error}`,
+          variant: "destructive",
+        })
+        setBatchExportMode(false)
+        clearExportSession()
+      } finally {
+        abortControllerRef.current = null
+      }
+    } else {
+      // Single export mode (existing functionality)
+      setIsExporting(true)
+      setExportCancelled(false)
+      setExportProgress(0)
+      setProgressDetails("Starting collection generation...")
+
+      try {
+        await exportSingleCollection(exportCount, collectionName, imageSize, useRules, batchSize)
+      } catch (error) {
+        console.error("Export error:", error)
+        toast({
+          title: "Error",
+          description: "Error generating collection: " + (error as Error).message,
+          variant: "destructive",
+        })
+      } finally {
+        setIsExporting(false)
+        setExportProgress(0)
+        setProgressDetails("")
+      }
+    }
   }
 
   const exportSingleCollection = async (
@@ -1293,91 +1921,100 @@ IPFS Instructions:
 
     console.log(`Starting export of ${exportCount} NFTs`)
 
-    const allCombinations = await generateAllUniqueCombinations(exportCount, useRules)
+    // Create abort controller
+    const abortController = new AbortController()
+    abortControllerRef.current = abortController
 
-    for (let i = 0; i < allCombinations.length; i++) {
-      if (exportCancelled) break
+    try {
+      const allCombinations = await generateBatchCombinations(exportCount, useRules, abortController.signal)
 
-      const progress = Math.round((i / allCombinations.length) * 95)
-      setExportProgress(progress)
-
-      const combination = allCombinations[i]
-
-      try {
-        const canvas = document.createElement("canvas")
-        canvas.width = imageSize
-        canvas.height = imageSize
-        const ctx = canvas.getContext("2d", {
-          alpha: false,
-          willReadFrequently: false,
-        })!
-
-        ctx.fillStyle = "white"
-        ctx.fillRect(0, 0, imageSize, imageSize)
-
-        const sortedLayers = layers.filter((layer) => combination[layer.id]).sort((a, b) => a.zIndex - b.zIndex)
-
-        for (const layer of sortedLayers) {
-          const itemId = combination[layer.id]
-          const item = layer.items.find((i) => i.id === itemId)
-          if (!item) continue
-
-          await new Promise<void>((resolve, reject) => {
-            const img = new Image()
-            img.onload = () => {
-              try {
-                ctx.drawImage(img, 0, 0, imageSize, imageSize)
-                resolve()
-              } catch (error) {
-                reject(error)
-              }
-            }
-            img.onerror = () => reject(new Error(`Failed to load image for ${item.name}`))
-            img.crossOrigin = "anonymous"
-            img.src = item.dataUrl
-          })
+      for (let i = 0; i < allCombinations.length; i++) {
+        if (abortController.signal.aborted) {
+          throw new Error("Export cancelled")
         }
 
-        const blob = await new Promise<Blob>((resolve) => {
-          canvas.toBlob((blob) => resolve(blob!), "image/png", 0.9)
-        })
+        const progress = Math.round((i / allCombinations.length) * 95)
+        setExportProgress(progress)
+        setProgressDetails(`Generating NFT ${i + 1} of ${allCombinations.length}...`)
 
-        imagesFolder?.file(`${i + 1}.png`, blob)
+        const combination = allCombinations[i]
 
-        const metadata = {
-          name: `${collectionName} #${i + 1}`,
-          description: `A unique NFT from the ${collectionName} collection`,
-          created_by: "",
-          image: `ipfs://[CID]/images/${i + 1}.png`,
-          attributes: sortedLayers.map((layer) => {
+        try {
+          const canvas = document.createElement("canvas")
+          canvas.width = imageSize
+          canvas.height = imageSize
+          const ctx = canvas.getContext("2d", {
+            alpha: false,
+            willReadFrequently: false,
+          })!
+
+          ctx.fillStyle = "white"
+          ctx.fillRect(0, 0, imageSize, imageSize)
+
+          const sortedLayers = layers.filter((layer) => combination[layer.id]).sort((a, b) => a.zIndex - b.zIndex)
+
+          for (const layer of sortedLayers) {
             const itemId = combination[layer.id]
             const item = layer.items.find((i) => i.id === itemId)
-            return {
-              trait_type: layer.name,
-              value: item?.name || "Unknown",
-            }
-          }),
+            if (!item) continue
+
+            await new Promise<void>((resolve, reject) => {
+              const img = new Image()
+              img.onload = () => {
+                try {
+                  ctx.drawImage(img, 0, 0, imageSize, imageSize)
+                  resolve()
+                } catch (error) {
+                  reject(error)
+                }
+              }
+              img.onerror = () => reject(new Error(`Failed to load image for ${item.name}`))
+              img.crossOrigin = "anonymous"
+              img.src = item.dataUrl
+            })
+          }
+
+          const blob = await new Promise<Blob>((resolve) => {
+            canvas.toBlob((blob) => resolve(blob!), "image/png", 0.8) // Reduced quality for speed
+          })
+
+          imagesFolder?.file(`${i + 1}.png`, blob)
+
+          const metadata = {
+            name: `${collectionName} #${i + 1}`,
+            description: `A unique NFT from the ${collectionName} collection`,
+            created_by: "",
+            image: `ipfs://[CID]/images/${i + 1}.png`,
+            attributes: sortedLayers.map((layer) => {
+              const itemId = combination[layer.id]
+              const item = layer.items.find((i) => i.id === itemId)
+              return {
+                trait_type: layer.name,
+                value: item?.name || "Unknown",
+              }
+            }),
+          }
+
+          metadataFolder?.file(`${i + 1}.json`, JSON.stringify(metadata, null, 2))
+
+          canvas.width = 1
+          canvas.height = 1
+
+          if (i % 10 === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 10))
+          }
+        } catch (error) {
+          console.error(`Error generating NFT ${i + 1}:`, error)
         }
-
-        metadataFolder?.file(`${i + 1}.json`, JSON.stringify(metadata, null, 2))
-
-        canvas.width = 1
-        canvas.height = 1
-
-        if (i % 10 === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 10))
-        }
-      } catch (error) {
-        console.error(`Error generating NFT ${i + 1}:`, error)
       }
-    }
 
-    if (!exportCancelled) {
-      setExportProgress(96)
+      if (!abortController.signal.aborted) {
+        setExportProgress(96)
+        setProgressDetails("Preparing ZIP file...")
 
-      zip.file(
-        "README.txt",
-        `NFT Collection: ${collectionName}
+        zip.file(
+          "README.txt",
+          `NFT Collection: ${collectionName}
 Generated on: ${new Date().toLocaleString()}
 Total NFTs: ${allCombinations.length}
 Image Size: ${imageSize}x${imageSize}px
@@ -1390,158 +2027,102 @@ IPFS Instructions:
 3. Replace [CID] in ALL metadata JSON files with your actual images CID
 4. Upload the 'metadata' folder to IPFS
 5. Use the metadata folder CID for your NFT contract`,
-      )
+        )
 
-      setExportProgress(98)
+        setExportProgress(98)
+        setProgressDetails("Creating ZIP file...")
 
-      const zipContent = await zip.generateAsync({
-        type: "blob",
-        compression: "DEFLATE",
-        compressionOptions: { level: 3 },
-        streamFiles: true,
-      })
+        const zipContent = await zip.generateAsync({
+          type: "blob",
+          compression: "STORE", // No compression for speed
+          streamFiles: false, // Disable streaming for faster generation
+        })
 
-      setExportProgress(100)
+        setExportProgress(100)
+        setProgressDetails("Starting download...")
 
-      const url = URL.createObjectURL(zipContent)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `${collectionName.toLowerCase().replace(/\s+/g, "-")}.zip`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
+        const url = URL.createObjectURL(zipContent)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = `${collectionName.toLowerCase().replace(/\s+/g, "-")}.zip`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
 
-      toast({
-        title: "Success",
-        description: `Collection with ${allCombinations.length} unique NFTs exported successfully!`,
-      })
+        toast({
+          title: "Success",
+          description: `Collection with ${allCombinations.length} unique NFTs exported successfully!`,
+        })
+      }
+    } finally {
+      abortControllerRef.current = null
     }
-
-    setIsExporting(false)
-    setExportProgress(0)
   }
-
-  const exportCollection = useCallback(
-    async (
-      exportCount: number,
-      collectionName: string,
-      imageSize: number,
-      useRules: boolean,
-      batchSize: number,
-      splitIntoMultiple = false,
-    ) => {
-      if (layers.length === 0) {
-        toast({
-          title: "Error",
-          description: "No layers added yet",
-          variant: "destructive",
-        })
-        return
-      }
-
-      const totalPossibleCombinations = layers.reduce((total, layer) => total * layer.items.length, 1)
-
-      if (exportCount > totalPossibleCombinations) {
-        toast({
-          title: "Warning",
-          description: `Requested ${exportCount} NFTs but only ${totalPossibleCombinations} unique combinations possible. Reducing to maximum possible.`,
-          variant: "destructive",
-        })
-        exportCount = totalPossibleCombinations
-      }
-
-      if (splitIntoMultiple && exportCount > 1500) {
-        const maxPerBatch = 1500
-        const numBatches = Math.ceil(exportCount / maxPerBatch)
-        setTotalBatches(numBatches)
-        setBatchExportMode(true)
-
-        console.log(`Starting batch export: ${exportCount} NFTs in ${numBatches} batches`)
-
-        try {
-          console.log("Generating all unique combinations...")
-          const allCombinations = await generateAllUniqueCombinations(exportCount, useRules)
-          console.log(`Generated ${allCombinations.length} unique combinations`)
-
-          for (let batchIndex = 0; batchIndex < numBatches; batchIndex++) {
-            if (exportCancelled) {
-              console.log("Export cancelled by user")
-              break
-            }
-
-            setCurrentBatch(batchIndex + 1)
-            const batchStart = batchIndex * maxPerBatch
-            const batchEnd = Math.min(batchStart + maxPerBatch, exportCount)
-            const batchCombinations = allCombinations.slice(batchStart, batchEnd)
-            const batchName = `${collectionName} - Batch ${batchIndex + 1}`
-            const startingNumber = batchStart + 1
-
-            console.log(
-              `Processing batch ${batchIndex + 1}/${numBatches}: ${batchCombinations.length} NFTs (${startingNumber}-${batchEnd})`,
-            )
-
-            await exportBatchWithCombinations(batchCombinations, batchName, imageSize, batchIndex + 1, startingNumber)
-
-            if (batchIndex < numBatches - 1) {
-              console.log(`Waiting before next batch...`)
-              await new Promise((resolve) => setTimeout(resolve, 3000))
-            }
-          }
-
-          setBatchExportMode(false)
-          setCurrentBatch(1)
-          setTotalBatches(1)
-
-          if (!exportCancelled) {
-            toast({
-              title: "Success",
-              description: `All ${numBatches} batches exported successfully! No duplicates generated.`,
-            })
-          }
-        } catch (error) {
-          console.error("Batch export failed:", error)
-          toast({
-            title: "Error",
-            description: `Batch export failed: ${error}`,
-            variant: "destructive",
-          })
-          setBatchExportMode(false)
-          setCurrentBatch(1)
-          setTotalBatches(1)
-        }
-        return
-      }
-
-      setIsExporting(true)
-      setExportCancelled(false)
-      setExportProgress(0)
-
-      try {
-        await exportSingleCollection(exportCount, collectionName, imageSize, useRules, batchSize)
-      } catch (error) {
-        console.error("Export error:", error)
-        toast({
-          title: "Error",
-          description: "Error generating collection: " + (error as Error).message,
-          variant: "destructive",
-        })
-      } finally {
-        setIsExporting(false)
-        setExportProgress(0)
-      }
-    },
-    [layers, traitMatchingRules, traitExclusionRules, manualMappings, toast, exportCancelled],
-  )
 
   const cancelExport = () => {
     setExportCancelled(true)
+
+    // Cancel any ongoing operations
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+
+    // Clear intervals
+    if (progressIntervalRef.current) {
+      clearInterval(progressIntervalRef.current)
+    }
+
+    // Reset states
     setIsExporting(false)
+    setBatchExportMode(false)
+    setCurrentBatchData(null)
+    setExportConfig(null)
+    setCompletedBatches([])
+    setBatchStatus("generating")
+    setCurrentBatch(1)
+    setTotalBatches(1)
+    setExportProgress(0)
+    setProgressDetails("")
+    setAutoDownload(false)
+
+    // Clear session
+    clearExportSession()
+    setExportSession(null)
+
     toast({
       title: "Cancelled",
       description: "Export cancelled",
       variant: "destructive",
     })
+  }
+
+  const handleDownloadBatch = () => {
+    if (currentBatchData) {
+      downloadBatch(currentBatchData)
+    }
+  }
+
+  const handleContinueToNext = () => {
+    if (currentBatch < totalBatches) {
+      generateNextBatch()
+    }
+  }
+
+  const resumeSession = () => {
+    if (exportSession && batchStatus === "paused") {
+      if (exportSession.currentBatchData) {
+        setBatchStatus("ready")
+        setProgressDetails("Session resumed - batch ready for download")
+        toast({
+          title: "Session Resumed",
+          description: `Batch ${currentBatch} is ready for download`,
+        })
+      } else {
+        // Resume generation
+        generateNextBatch()
+      }
+    }
   }
 
   const clearGeneratedHistory = useCallback(() => {
@@ -1552,8 +2133,15 @@ IPFS Instructions:
     })
   }, [toast])
 
-  // Inside the NFTLayerViewer component, add the export and import handlers
+  const clearTraitUsageStats = useCallback(() => {
+    setTraitUsageStats({})
+    toast({
+      title: "Success",
+      description: "Trait usage statistics cleared. All traits will have equal priority again.",
+    })
+  }, [toast])
 
+  // Project management functions
   const exportProject = useCallback(() => {
     if (layers.length === 0) {
       toast({
@@ -1670,16 +2258,49 @@ IPFS Instructions:
     [toast],
   )
 
-  // In the return statement, add the new Project Management card
-  // Place this card right after the main title and description div.
-
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-6">
       <div className="max-w-6xl mx-auto space-y-6">
         <div className="text-center">
           <h1 className="text-4xl font-bold text-purple-400 mb-2">NFT Layer Viewer</h1>
-          <p className="text-gray-400">Enhanced with trait exclusion and optimized batch processing</p>
+          <p className="text-gray-400">Enhanced with persistent sessions and optimized batch processing</p>
         </div>
+
+        {/* Session Recovery Card */}
+        {exportSession && batchStatus === "paused" && (
+          <Card className="bg-yellow-900/20 border-yellow-500/30">
+            <CardHeader>
+              <CardTitle className="text-yellow-400">Session Recovery</CardTitle>
+              <CardDescription>
+                Found a previous export session that was interrupted. You can resume where you left off.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-2 gap-4 text-sm">
+                <div>
+                  <strong>Collection:</strong> {exportSession.collectionName}
+                </div>
+                <div>
+                  <strong>Progress:</strong> {completedBatches.length} of {totalBatches} batches completed
+                </div>
+                <div>
+                  <strong>Current Batch:</strong> {currentBatch}
+                </div>
+                <div>
+                  <strong>Total NFTs:</strong> {exportSession.totalCount}
+                </div>
+              </div>
+              <div className="flex space-x-4">
+                <Button onClick={resumeSession} className="bg-yellow-600 hover:bg-yellow-700">
+                  Resume Session
+                </Button>
+                <Button onClick={clearExportSession} variant="outline">
+                  Start Fresh
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
@@ -2031,19 +2652,24 @@ IPFS Instructions:
             <ExportManager
               isExporting={isExporting}
               exportProgress={exportProgress}
-              onExport={exportCollection}
+              onExport={startBatchExport}
               onCancel={cancelExport}
               generatedCount={generatedCombinations.size}
               onClearHistory={clearGeneratedHistory}
               batchExportMode={batchExportMode}
               currentBatch={currentBatch}
               totalBatches={totalBatches}
+              batchStatus={batchStatus}
+              onDownloadBatch={handleDownloadBatch}
+              onContinueToNext={handleContinueToNext}
+              completedBatches={completedBatches}
+              currentBatchNFTs={currentBatchData?.combinations.length || 0}
+              progressDetails={progressDetails}
+              autoDownload={autoDownload}
+              onToggleAutoDownload={setAutoDownload}
             />
           </CardContent>
         </Card>
-        <Button className="bg-red-500 hover:bg-red-700" onClick={clearTraitUsageStats}>
-          Clear Trait Usage Stats
-        </Button>
       </div>
     </div>
   )
