@@ -1,7 +1,6 @@
 "use client"
 
 import type React from "react"
-
 import { useState, useRef, useCallback, useEffect } from "react"
 import { useToast } from "@/hooks/use-toast"
 import { Button } from "@/components/ui/button"
@@ -9,17 +8,20 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { TraitRulesManager } from "@/components/trait-rules-manager"
 import { NFTPreview } from "@/components/nft-preview"
 import { TraitUsageStats } from "@/components/trait-usage-stats"
 import { RarityAnalysis } from "@/components/rarity-analysis"
 import { ExportManager } from "@/components/export-manager"
+import { colorFamilyFromName } from "@/lib/color-utils"
 
 interface LayerItem {
   id: number
   name: string
   dataUrl: string
   rarity?: number
+  count?: number // desired total count across the whole collection
 }
 
 interface RarityPreset {
@@ -32,6 +34,7 @@ interface Layer {
   name: string
   items: LayerItem[]
   zIndex: number
+  exactCountMode?: boolean // whether this layer uses exact numbers mode
 }
 
 interface TraitMatchingRule {
@@ -90,6 +93,8 @@ interface BatchData {
   startingNumber: number
 }
 
+type ExportStatus = "generating" | "ready" | "downloading" | "completed" | "paused"
+
 interface ExportSession {
   id: string
   totalCount: number
@@ -102,10 +107,19 @@ interface ExportSession {
   completedBatches: number[]
   generatedCombinations: string[]
   timestamp: number
-  status: "generating" | "ready" | "downloading" | "completed" | "paused"
+  status: ExportStatus
   currentBatchData?: BatchData
   autoDownload: boolean
+  quotas?: Record<string, number>
+  pairUsage?: Record<string, number>
 }
+
+// Helper keys
+const quotaKey = (layerId: number, itemId: number) => `${layerId}:${itemId}`
+const rulePairKey = (ruleId: number, sourceItemId: number, targetLayerId: number, targetItemId: number) =>
+  `R|${ruleId}|${sourceItemId}|${targetLayerId}|${targetItemId}`
+const mapPairKey = (sourceItemId: number, targetLayerId: number, targetItemId: number) =>
+  `M|${sourceItemId}|${targetLayerId}|${targetItemId}`
 
 export default function NFTLayerViewer() {
   const { toast } = useToast()
@@ -115,7 +129,7 @@ export default function NFTLayerViewer() {
   const [manualMappings, setManualMappings] = useState<ManualMapping[]>([])
   const [selectedItems, setSelectedItems] = useState<Record<number, number>>({})
   const [exportProgress, setExportProgress] = useState(0)
-  const [isExporting, setIsExporting] = useState(false)
+  const [isExporting, setIsExporting] = useState<boolean>(false)
   const [exportCancelled, setExportCancelled] = useState(false)
 
   const [uniquenessData, setUniquenessData] = useState<{
@@ -138,19 +152,21 @@ export default function NFTLayerViewer() {
   ])
 
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const workerRef = useRef<Worker | null>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   const [generatedCombinations, setGeneratedCombinations] = useState<Set<string>>(new Set())
 
-  // Enhanced batch export state with persistence
+  // Batch export & session
   const [batchExportMode, setBatchExportMode] = useState(false)
   const [currentBatch, setCurrentBatch] = useState(1)
+  const currentBatchRef = useRef(1)
+  useEffect(() => {
+    currentBatchRef.current = currentBatch
+  }, [currentBatch])
+
   const [totalBatches, setTotalBatches] = useState(1)
-  const [batchStatus, setBatchStatus] = useState<"generating" | "ready" | "downloading" | "completed" | "paused">(
-    "generating",
-  )
+  const [batchStatus, setBatchStatus] = useState<ExportStatus>("generating")
   const [completedBatches, setCompletedBatches] = useState<number[]>([])
   const [currentBatchData, setCurrentBatchData] = useState<BatchData | null>(null)
   const [exportConfig, setExportConfig] = useState<{
@@ -164,11 +180,18 @@ export default function NFTLayerViewer() {
   const [autoDownload, setAutoDownload] = useState(false)
   const [progressDetails, setProgressDetails] = useState<string>("")
 
-  // Session persistence functions
+  // Quotas & pair usage
+  const quotasRef = useRef<Record<string, number>>({})
+  const pairUsageRef = useRef<Record<string, number>>({})
+
+  // Concurrency guards
+  const isGeneratingRef = useRef(false)
+  const isDownloadingRef = useRef(false)
+
+  // Session persistence
   const saveExportSession = useCallback((session: ExportSession) => {
     try {
       localStorage.setItem("nft-export-session", JSON.stringify(session))
-      console.log("Export session saved:", session.id)
     } catch (error) {
       console.error("Failed to save export session:", error)
     }
@@ -179,9 +202,7 @@ export default function NFTLayerViewer() {
       const saved = localStorage.getItem("nft-export-session")
       if (saved) {
         const session = JSON.parse(saved) as ExportSession
-        // Check if session is less than 24 hours old
         if (Date.now() - session.timestamp < 24 * 60 * 60 * 1000) {
-          console.log("Export session loaded:", session.id)
           return session
         } else {
           localStorage.removeItem("nft-export-session")
@@ -196,10 +217,9 @@ export default function NFTLayerViewer() {
 
   const clearExportSession = useCallback(() => {
     localStorage.removeItem("nft-export-session")
-    console.log("Export session cleared")
   }, [])
 
-  // Load session on component mount
+  // Load session on mount (after layers exist)
   useEffect(() => {
     const savedSession = loadExportSession()
     if (savedSession && layers.length > 0) {
@@ -218,9 +238,9 @@ export default function NFTLayerViewer() {
       setBatchStatus(savedSession.status === "generating" ? "paused" : savedSession.status)
       setCurrentBatchData(savedSession.currentBatchData || null)
       setAutoDownload(savedSession.autoDownload || false)
-
-      // Restore generated combinations
       setGeneratedCombinations(new Set(savedSession.generatedCombinations))
+      quotasRef.current = savedSession.quotas || {}
+      pairUsageRef.current = savedSession.pairUsage || {}
 
       toast({
         title: "Session Restored",
@@ -229,14 +249,12 @@ export default function NFTLayerViewer() {
     }
   }, [layers.length, loadExportSession, toast])
 
-  // Save session whenever it changes
+  // Persist session
   useEffect(() => {
-    if (exportSession) {
-      saveExportSession(exportSession)
-    }
+    if (exportSession) saveExportSession(exportSession)
   }, [exportSession, saveExportSession])
 
-  // Prevent page unload during export
+  // Warn before leaving
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (batchExportMode && (batchStatus === "generating" || batchStatus === "downloading")) {
@@ -245,7 +263,6 @@ export default function NFTLayerViewer() {
         return "NFT generation is in progress. Are you sure you want to leave?"
       }
     }
-
     window.addEventListener("beforeunload", handleBeforeUnload)
     return () => window.removeEventListener("beforeunload", handleBeforeUnload)
   }, [batchExportMode, batchStatus])
@@ -253,69 +270,46 @@ export default function NFTLayerViewer() {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort()
-      }
-      if (progressIntervalRef.current) {
-        clearInterval(progressIntervalRef.current)
-      }
-      if (workerRef.current) {
-        workerRef.current.terminate()
-      }
+      if (abortControllerRef.current) abortControllerRef.current.abort()
+      if (progressIntervalRef.current) clearInterval(progressIntervalRef.current)
     }
   }, [])
 
-  // Audio notification function
+  // Audio notification
   const playNotificationSound = useCallback(() => {
     try {
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
-
       const playBeep = (frequency: number, duration: number, delay: number) => {
         setTimeout(() => {
           const oscillator = audioContext.createOscillator()
           const gainNode = audioContext.createGain()
-
           oscillator.connect(gainNode)
           gainNode.connect(audioContext.destination)
-
           oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime)
           oscillator.type = "sine"
-
           gainNode.gain.setValueAtTime(0.3, audioContext.currentTime)
           gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration)
-
           oscillator.start(audioContext.currentTime)
           oscillator.stop(audioContext.currentTime + duration)
         }, delay)
       }
-
-      // Play notification sequence
       playBeep(800, 0.15, 0)
       playBeep(1000, 0.15, 200)
       playBeep(1200, 0.3, 400)
-    } catch (error) {
-      console.log("Audio notification not available:", error)
+    } catch {
+      // ignore
     }
   }, [])
 
-  // Layer management functions
+  // Layer management
   const addLayer = useCallback(
     async (layerName: string, files: FileList) => {
       if (!layerName.trim()) {
-        toast({
-          title: "Error",
-          description: "Please enter a layer name",
-          variant: "destructive",
-        })
+        toast({ title: "Error", description: "Please enter a layer name", variant: "destructive" })
         return
       }
-
       if (files.length === 0) {
-        toast({
-          title: "Error",
-          description: "Please select at least one image file",
-          variant: "destructive",
-        })
+        toast({ title: "Error", description: "Please select at least one image file", variant: "destructive" })
         return
       }
 
@@ -327,64 +321,46 @@ export default function NFTLayerViewer() {
         id: layerId,
         name: layerName,
         items: [],
-        zIndex: zIndex,
+        zIndex,
+        exactCountMode: false,
       }
 
       const items: LayerItem[] = []
       const fileArray = Array.from(files)
-      let processedCount = 0
 
       for (let i = 0; i < fileArray.length; i++) {
         const file = fileArray[i]
-
-        if (!file.type.startsWith("image/")) {
-          console.log(`Skipping non-image file: ${file.name}`)
-          processedCount++
-          continue
-        }
+        if (!file.type.startsWith("image/")) continue
 
         const itemName = file.name.replace(/\.[^/.]+$/, "")
-        const itemId = Date.now() * 1000 + i + Math.random() * 1000
+        const itemId = Math.floor(Date.now() * 1000 + i + Math.random() * 1000)
 
-        try {
-          const dataUrl = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader()
-            reader.onload = (e) => {
-              const result = e.target?.result
-              if (typeof result === "string") {
-                resolve(result)
-              } else {
-                reject(new Error("Failed to read file as data URL"))
-              }
-            }
-            reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`))
-            reader.readAsDataURL(file)
-          })
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = (e) => {
+            const result = e.target?.result
+            if (typeof result === "string") resolve(result)
+            else reject(new Error("Failed to read file as data URL"))
+          }
+          reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`))
+          reader.readAsDataURL(file)
+        })
 
-          items.push({
-            id: Math.floor(itemId),
-            name: itemName,
-            dataUrl: dataUrl,
-            rarity: 100 / fileArray.length,
-          })
-
-          console.log(`Successfully processed: ${itemName}`)
-        } catch (error) {
-          console.error(`Error processing file ${file.name}:`, error)
-        }
-
-        processedCount++
+        items.push({
+          id: itemId,
+          name: itemName,
+          dataUrl,
+          rarity: 100 / fileArray.length,
+          count: 0,
+        })
       }
-
-      console.log(`Processed ${processedCount} files, successfully added ${items.length} items`)
 
       if (items.length > 0) {
         layer.items = items
         setLayers((prev) => [...prev, layer])
-
         toast({
           title: "Success",
-          description: `Added ${items.length} of ${files.length} images to layer "${layerName}"`,
+          description: `Added ${items.length} of ${files.length} images to "${layerName}"`,
         })
       } else {
         toast({
@@ -401,38 +377,40 @@ export default function NFTLayerViewer() {
     const layerId = nextId
     setNextId((prev) => prev + 1)
     const zIndex = layers.length
-
     const layer: Layer = {
       id: layerId,
       name: `Test Layer ${layerId}`,
       items: [
         {
           id: Date.now() + 1,
-          name: "Red Square",
+          name: "Race A",
           dataUrl:
             "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAiIGhlaWdodD0iMTAwIj48cmVjdCB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgZmlsbD0iI2ZmMDAwMCIvPjwvc3ZnPg==",
           rarity: 33.33,
+          count: 0,
         },
         {
           id: Date.now() + 2,
-          name: "Blue Circle",
+          name: "Race B",
           dataUrl:
             "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAiIGhlaWdodD0iMTAwIj48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSI0MCIgZmlsbD0iIzAwMDBmZiIvPjwvc3ZnPg==",
           rarity: 33.33,
+          count: 0,
         },
         {
           id: Date.now() + 3,
-          name: "Green Triangle",
+          name: "Race C",
           dataUrl:
             "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAiIGhlaWdodD0iMTAwIj48cG9seWdvbiBwb2ludHM9IjUwLDEwIDkwLDkwIDEwLDkwIiBmaWxsPSIjMDBmZjAwIi8+PC9zdmc+",
           rarity: 33.33,
+          count: 0,
         },
       ],
-      zIndex: zIndex,
+      zIndex,
+      exactCountMode: false,
     }
 
     setLayers((prev) => [...prev, layer])
-
     toast({
       title: "Success",
       description: `Added test layer "${layer.name}"`,
@@ -460,9 +438,7 @@ export default function NFTLayerViewer() {
       setTraitExclusionRules((prev) =>
         prev.filter((rule) => rule.sourceLayerId !== layerId && rule.targetLayerId !== layerId),
       )
-      setManualMappings((prev) =>
-        prev.filter((mapping) => mapping.sourceLayerId !== layerId && mapping.targetLayerId !== layerId),
-      )
+      setManualMappings((prev) => prev.filter((m) => m.sourceLayerId !== layerId && m.targetLayerId !== layerId))
 
       setSelectedItems((prev) => {
         const newSelected = { ...prev }
@@ -491,7 +467,6 @@ export default function NFTLayerViewer() {
 
       const targetZIndex = direction === "up" ? layer.zIndex + 1 : layer.zIndex - 1
       const targetLayer = prev.find((l) => l.zIndex === targetZIndex)
-
       if (!targetLayer) return prev
 
       return prev.map((l) => {
@@ -506,7 +481,6 @@ export default function NFTLayerViewer() {
     (sourceLayerId: number, targetLayerId: number, property: string) => {
       const sourceLayer = layers.find((l) => l.id === sourceLayerId)
       const targetLayer = layers.find((l) => l.id === targetLayerId)
-
       if (!sourceLayer || !targetLayer) return
 
       const rule: TraitMatchingRule = {
@@ -602,180 +576,8 @@ export default function NFTLayerViewer() {
     [toast],
   )
 
+  // Property extraction helper
   const extractProperty = (itemName: string, property: string) => {
-    const colors = [
-      "red",
-      "blue",
-      "green",
-      "yellow",
-      "purple",
-      "orange",
-      "black",
-      "white",
-      "brown",
-      "pink",
-      "cyan",
-      "magenta",
-      "gray",
-      "grey",
-      "charcoal",
-    ]
-    const words = itemName
-      .toLowerCase()
-      .split(/[\s\-_]+/)
-      .filter((word) => word.length > 0)
-
-    if (property.toLowerCase() === "color") {
-      const colorWord = words.find((word) => colors.includes(word))
-      return colorWord || words[0]
-    }
-
-    const propertyIndex = words.findIndex((word) => word.includes(property.toLowerCase()))
-    if (propertyIndex >= 0 && propertyIndex < words.length - 1) {
-      return words[propertyIndex + 1]
-    }
-
-    return words[0]
-  }
-
-  const applyMatchingRules = (sourceLayerId: number, sourceItemId: number, selected: Record<number, number>) => {
-    console.log(`🔧 Applying matching rules for source layer ${sourceLayerId}, item ${sourceItemId}`)
-
-    const sourceLayer = layers.find((l) => l.id === sourceLayerId)
-    const sourceItem = sourceLayer?.items.find((i) => i.id === sourceItemId)
-
-    if (!sourceItem) {
-      console.log(`❌ Source item not found`)
-      return
-    }
-
-    console.log(`🎯 Processing source item: "${sourceItem.name}"`)
-
-    // Apply automatic matching rules
-    const relevantRules = traitMatchingRules.filter((rule) => rule.sourceLayerId === sourceLayerId)
-    console.log(`Found ${relevantRules.length} relevant matching rules`)
-
-    relevantRules.forEach((rule) => {
-      console.log(`🔍 Applying rule: ${rule.sourceLayerName} → ${rule.targetLayerName} (${rule.property})`)
-
-      const targetLayer = layers.find((l) => l.id === rule.targetLayerId)
-      if (!targetLayer) {
-        console.log(`❌ Target layer not found for rule ${rule.id}`)
-        return
-      }
-
-      // Use the improved findMatchingItem function
-      const matchingItem = findMatchingItem(sourceItem, targetLayer.items, rule.property)
-
-      if (matchingItem) {
-        console.log(`✅ MATCH FOUND: "${sourceItem.name}" → "${matchingItem.name}"`)
-        selected[rule.targetLayerId] = matchingItem.id
-      } else {
-        console.log(`❌ NO MATCH FOUND for "${sourceItem.name}" in ${rule.targetLayerName}`)
-        console.log(
-          `Available items in ${rule.targetLayerName}:`,
-          targetLayer.items.map((item) => item.name),
-        )
-
-        // For color matching, try a more lenient approach before falling back
-        if (rule.property.toLowerCase() === "color") {
-          console.log(`🔍 Trying lenient color matching as fallback...`)
-
-          // Extract source color more aggressively
-          const sourceWords = sourceItem.name
-            .toLowerCase()
-            .split(/[\s\-_]+/)
-            .filter((word) => word.length > 0)
-          let fallbackColorMatch = null
-
-          // Try each word from source as potential color
-          for (const sourceWord of sourceWords) {
-            const colorMatches = targetLayer.items.filter((item) => {
-              const targetWords = item.name
-                .toLowerCase()
-                .split(/[\s\-_]+/)
-                .filter((word) => word.length > 0)
-              return targetWords.some(
-                (targetWord) =>
-                  targetWord === sourceWord || targetWord.includes(sourceWord) || sourceWord.includes(targetWord),
-              )
-            })
-
-            if (colorMatches.length > 0) {
-              fallbackColorMatch = colorMatches[Math.floor(Math.random() * colorMatches.length)]
-              console.log(
-                `🎨 Lenient color match found: "${sourceItem.name}" → "${fallbackColorMatch.name}" (via "${sourceWord}")`,
-              )
-              break
-            }
-          }
-
-          if (fallbackColorMatch) {
-            selected[rule.targetLayerId] = fallbackColorMatch.id
-          } else {
-            console.log(`⚠️ No color matches found even with lenient matching - skipping this rule`)
-          }
-        } else {
-          // For non-color properties, try to find any valid item that won't violate exclusion rules
-          const validItems = targetLayer.items.filter((item) => {
-            return !traitExclusionRules.some((exclusionRule) => {
-              if (exclusionRule.sourceLayerId === sourceLayerId && exclusionRule.targetLayerId === rule.targetLayerId) {
-                if (exclusionRule.sourceItemId && exclusionRule.targetItemId) {
-                  return exclusionRule.sourceItemId === sourceItemId && exclusionRule.targetItemId === item.id
-                } else if (exclusionRule.property) {
-                  const sourceProp = extractProperty(sourceItem.name, exclusionRule.property)
-                  const targetProp = extractProperty(item.name, exclusionRule.property)
-                  return sourceProp.toLowerCase() === targetProp.toLowerCase()
-                }
-              }
-              return false
-            })
-          })
-
-          if (validItems.length > 0) {
-            const fallbackItem = validItems[Math.floor(Math.random() * validItems.length)]
-            console.log(`🔄 Using fallback item: "${fallbackItem.name}"`)
-            selected[rule.targetLayerId] = fallbackItem.id
-          } else {
-            console.log(`⚠️ No valid fallback items available`)
-          }
-        }
-      }
-    })
-
-    // Apply manual mappings (these take absolute priority)
-    const relevantMappings = manualMappings.filter(
-      (mapping) => mapping.sourceLayerId === sourceLayerId && mapping.sourceItemId === sourceItemId,
-    )
-
-    console.log(`Found ${relevantMappings.length} relevant manual mappings`)
-
-    relevantMappings.forEach((mapping) => {
-      console.log(`👆 MANUAL MAPPING APPLIED: "${mapping.sourceItemName}" → "${mapping.targetItemName}"`)
-      selected[mapping.targetLayerId] = mapping.targetItemId
-    })
-  }
-
-  // Add the findMatchingItem function to the main component scope
-  const findMatchingItem = (sourceItem: any, targetItems: any[], property: string) => {
-    console.log(`Finding match for "${sourceItem.name}" using property "${property}"`)
-
-    if (property === "name") {
-      const sourcePrefix = sourceItem.name.split(/[-_]/)[0].toLowerCase().trim()
-      console.log(`Source prefix: "${sourcePrefix}"`)
-
-      const match = targetItems.find((item) => {
-        const targetPrefix = item.name.split(/[-_]/)[0].toLowerCase().trim()
-        const matches = sourcePrefix === targetPrefix
-        console.log(`   Comparing "${sourcePrefix}" with "${targetPrefix}" (${item.name}): ${matches}`)
-        return matches
-      })
-
-      console.log(`Match found:`, match?.name || "None")
-      return match
-    }
-
-    // Enhanced color matching with grouping
     const colors = [
       "red",
       "blue",
@@ -802,115 +604,28 @@ export default function NFTLayerViewer() {
       "maroon",
       "olive",
     ]
-
-    const extractColor = (itemName: string) => {
-      const words = itemName
-        .toLowerCase()
-        .split(/[\s\-_]+/)
-        .filter((word) => word.length > 0)
-
-      // Find color words in the item name
-      const foundColors = words.filter((word) => colors.includes(word))
-
-      if (foundColors.length > 0) {
-        return foundColors[0]
-      }
-
-      // Check for partial matches
-      for (const word of words) {
-        for (const color of colors) {
-          if (word.includes(color) || color.includes(word)) {
-            return color
-          }
-        }
-      }
-
-      return null
-    }
-
-    if (property.toLowerCase() === "color") {
-      const sourceColor = extractColor(sourceItem.name)
-      console.log(`🎨 Source color extracted: "${sourceColor}"`)
-
-      if (!sourceColor) {
-        console.log(`No color found in source item "${sourceItem.name}"`)
-        return null
-      }
-
-      // Find ALL items with the same color
-      const matchingItems = targetItems.filter((item) => {
-        const targetColor = extractColor(item.name)
-        const matches =
-          sourceColor === targetColor ||
-          (sourceColor === "grey" && targetColor === "gray") ||
-          (sourceColor === "gray" && targetColor === "grey")
-
-        if (matches) {
-          console.log(
-            `   ✅ Color group match: "${sourceItem.name}" (${sourceColor}) ↔ "${item.name}" (${targetColor})`,
-          )
-        }
-
-        return matches
-      })
-
-      console.log(
-        `🎨 Found ${matchingItems.length} items in ${sourceColor} color group:`,
-        matchingItems.map((item) => item.name),
-      )
-
-      // Return a random item from the matching color group
-      if (matchingItems.length > 0) {
-        const randomMatch = matchingItems[Math.floor(Math.random() * matchingItems.length)]
-        console.log(`🎲 Selected random match from color group: "${randomMatch.name}"`)
-        return randomMatch
-      }
-
-      return null
-    }
-
-    // For other properties
-    const sourceWords = sourceItem.name
+    const words = itemName
       .toLowerCase()
       .split(/[\s\-_]+/)
       .filter((word) => word.length > 0)
-    const propertyIndex = sourceWords.findIndex((word) => word.includes(property.toLowerCase()))
-    const sourceProperty =
-      propertyIndex >= 0 && propertyIndex < sourceWords.length - 1 ? sourceWords[propertyIndex + 1] : sourceWords[0]
 
-    console.log(`🏷️ Looking for property "${property}" match: "${sourceProperty}"`)
-
-    const matchingItems = targetItems.filter((item) => {
-      const targetWords = item.name
-        .toLowerCase()
-        .split(/[\s\-_]+/)
-        .filter((word) => word.length > 0)
-      const targetPropertyIndex = targetWords.findIndex((word) => word.includes(property.toLowerCase()))
-      const targetProperty =
-        targetPropertyIndex >= 0 && targetPropertyIndex < targetWords.length - 1
-          ? targetWords[targetPropertyIndex + 1]
-          : targetWords[0]
-
-      const matches = sourceProperty === targetProperty
-      if (matches) {
-        console.log(`   ✅ Property match: "${sourceProperty}" → "${targetProperty}" (${item.name})`)
-      }
-      return matches
-    })
-
-    // Return a random item from the matching group
-    if (matchingItems.length > 0) {
-      const randomMatch = matchingItems[Math.floor(Math.random() * matchingItems.length)]
-      console.log(`🎲 Selected random match: "${randomMatch.name}"`)
-      return randomMatch
+    if (property.toLowerCase() === "color") {
+      const colorWord = words.find((word) => colors.includes(word))
+      return colorWord || words[0]
     }
 
-    console.log(`❌ No matches found for property "${property}"`)
-    return null
+    const propertyIndex = words.findIndex((word) => word.includes(property.toLowerCase()))
+    if (propertyIndex >= 0 && propertyIndex < words.length - 1) {
+      return words[propertyIndex + 1]
+    }
+
+    return words[0]
   }
 
+  // Usage stats
   const [traitUsageStats, setTraitUsageStats] = useState<Record<string, Record<number, number>>>({})
 
+  // Weighted selection
   const selectWeightedRandom = (items: LayerItem[], layerId: number, forceBalance = false): LayerItem | null => {
     if (items.length === 0) return null
 
@@ -919,7 +634,6 @@ export default function NFTLayerViewer() {
         const randomIndex = Math.floor(Math.random() * items.length)
         return items[randomIndex]
       }
-      // Standard weighted selection
       const totalWeight = items.reduce((sum, item) => sum + (item.rarity || 0), 0)
       let random = Math.random() * totalWeight
       for (const item of items) {
@@ -931,7 +645,6 @@ export default function NFTLayerViewer() {
       return items[items.length - 1]
     }
 
-    // Advanced balancing with desirability score
     const layerStats = traitUsageStats[layerId] || {}
     const totalUsageInLayer = Object.values(layerStats).reduce((sum, count) => sum + count, 0)
     const averageUsage = totalUsageInLayer > 0 ? totalUsageInLayer / items.length : 0
@@ -941,9 +654,9 @@ export default function NFTLayerViewer() {
       let usageMultiplier = 1
 
       if (usage === 0) {
-        usageMultiplier = 10 // Heavily prioritize unused items
+        usageMultiplier = 10
       } else if (averageUsage > 0 && usage < averageUsage) {
-        usageMultiplier = 1 + ((averageUsage - usage) / averageUsage) * 2 // Boost underused items
+        usageMultiplier = 1 + ((averageUsage - usage) / averageUsage) * 2
       }
 
       const baseWeight = rarityMode === "weighted" ? item.rarity || 1 : 1
@@ -952,26 +665,39 @@ export default function NFTLayerViewer() {
       return { ...item, score }
     })
 
-    const totalScore = scoredItems.reduce((sum, item) => sum + item.score, 0)
+    const totalScore = scoredItems.reduce((sum, item) => sum + (item as any).score, 0)
     if (totalScore === 0) {
       return items[Math.floor(Math.random() * items.length)]
     }
 
     let random = Math.random() * totalScore
-    for (const item of scoredItems) {
+    for (const item of scoredItems as any[]) {
       random -= item.score
       if (random <= 0) {
         return item
       }
     }
 
-    return scoredItems[scoredItems.length - 1]
+    return scoredItems[scoredItems.length - 1] as any
+  }
+
+  // Quota-based selection for exact-count layers
+  const selectWithQuota = (layer: Layer): LayerItem | null => {
+    const candidates = layer.items.filter((it) => (quotasRef.current[quotaKey(layer.id, it.id)] || 0) > 0)
+    if (candidates.length === 0) return null
+    const weights = candidates.map((it) => quotasRef.current[quotaKey(layer.id, it.id)] || 0)
+    const total = weights.reduce((s, w) => s + w, 0)
+    let r = Math.random() * total
+    for (let i = 0; i < candidates.length; i++) {
+      r -= weights[i]
+      if (r <= 0) return candidates[i]
+    }
+    return candidates[candidates.length - 1]
   }
 
   const updateTraitUsage = (combination: Record<number, number>) => {
     setTraitUsageStats((prev) => {
       const newStats = { ...prev }
-
       Object.entries(combination).forEach(([layerId, itemId]) => {
         const layerIdNum = Number(layerId)
         const itemIdNum = Number(itemId)
@@ -982,14 +708,316 @@ export default function NFTLayerViewer() {
 
         newStats[layerIdNum][itemIdNum] = (newStats[layerIdNum][itemIdNum] || 0) + 1
       })
-
       return newStats
     })
   }
 
+  // Head/Body helpers
+  const getHeadBodyLayers = () => {
+    const headLayer = layers.find((l) => /head|face|skull/i.test(l.name))
+    const bodyLayer = layers.find((l) => /body|torso/i.test(l.name))
+    return { headLayer, bodyLayer }
+  }
+
+  const isHeadBodyCoherent = (combo: Record<number, number>): boolean => {
+    const { headLayer, bodyLayer } = getHeadBodyLayers()
+    if (!headLayer || !bodyLayer) return true
+    const headId = combo[headLayer.id]
+    const bodyId = combo[bodyLayer.id]
+    if (!headId || !bodyId) return true
+    const headItem = headLayer.items.find((i) => i.id === headId)
+    const bodyItem = bodyLayer.items.find((i) => i.id === bodyId)
+    if (!headItem || !bodyItem) return true
+    const hf = colorFamilyFromName(headItem.name)
+    const bf = colorFamilyFromName(bodyItem.name)
+    if (!hf || !bf) return true
+    return hf === bf
+  }
+
+  const tryFixBodyToMatchHead = (combo: Record<number, number>, respectQuotas: boolean): boolean => {
+    const { headLayer, bodyLayer } = getHeadBodyLayers()
+    if (!headLayer || !bodyLayer) return true
+
+    const headItem = headLayer.items.find((i) => i.id === combo[headLayer.id])
+    if (!headItem) return true
+
+    const match = findMatchingItem(headItem, bodyLayer.items, "color")
+    if (!match) return false
+
+    if (respectQuotas && bodyLayer.exactCountMode) {
+      const rem = quotasRef.current[quotaKey(bodyLayer.id, match.id)] || 0
+      if (rem <= 0) return false
+    }
+
+    // check exclusions
+    const proposal = { ...combo, [bodyLayer.id]: match.id }
+    for (const rule of traitExclusionRules) {
+      const sId = proposal[rule.sourceLayerId]
+      const tId = proposal[rule.targetLayerId]
+      if (!sId || !tId) continue
+      if (rule.sourceItemId && rule.targetItemId) {
+        if (sId === rule.sourceItemId && tId === rule.targetItemId) return false
+      } else if (rule.property) {
+        const sLayer = layers.find((l) => l.id === rule.sourceLayerId)
+        const tLayer = layers.find((l) => l.id === rule.targetLayerId)
+        const sItem = sLayer?.items.find((i) => i.id === sId)
+        const tItem = tLayer?.items.find((i) => i.id === tId)
+        if (sItem && tItem) {
+          const sp = extractProperty(sItem.name, rule.property)
+          const tp = extractProperty(tItem.name, rule.property)
+          if (sp.toLowerCase() === tp.toLowerCase()) return false
+        }
+      }
+    }
+
+    combo[bodyLayer.id] = match.id
+    return true
+  }
+
+  // Rules composition
+  const getEffectiveMatchingRules = () => {
+    const rules = [...traitMatchingRules]
+    const { headLayer, bodyLayer } = getHeadBodyLayers()
+
+    if (headLayer && bodyLayer) {
+      const exists = rules.some(
+        (r) =>
+          r.sourceLayerId === headLayer.id && r.targetLayerId === bodyLayer.id && r.property.toLowerCase() === "color",
+      )
+      if (!exists) {
+        rules.push({
+          id: -1,
+          sourceLayerId: headLayer.id,
+          targetLayerId: bodyLayer.id,
+          sourceLayerName: headLayer.name,
+          targetLayerName: bodyLayer.name,
+          property: "color",
+        })
+      }
+    }
+
+    // sort: explicit rules first, implicit last
+    return rules.sort((a, b) => {
+      if (a.id === -1 && b.id !== -1) return 1
+      if (a.id !== -1 && b.id === -1) return -1
+      return 0
+    })
+  }
+
+  // Single property helper (compat)
+  const findMatchingItem = (sourceItem: any, targetItems: any[], property: string) => {
+    if (property === "name") {
+      const sourcePrefix = sourceItem.name.split(/[-_]/)[0].toLowerCase().trim()
+      return targetItems.find((item) => {
+        const targetPrefix = item.name.split(/[-_]/)[0].toLowerCase().trim()
+        return sourcePrefix === targetPrefix
+      })
+    }
+
+    if (property.toLowerCase() === "color") {
+      const sourceFamily = colorFamilyFromName(sourceItem.name)
+      if (!sourceFamily) return null
+      const matches = targetItems.filter((t) => colorFamilyFromName(t.name) === sourceFamily)
+      if (matches.length > 0) {
+        return matches[Math.floor(Math.random() * matches.length)]
+      }
+      return null
+    }
+
+    const sourceWords = sourceItem.name
+      .toLowerCase()
+      .split(/[\s\-_]+/)
+      .filter((word: string) => word.length > 0)
+    const propertyIndex = sourceWords.findIndex((word: string) => word.includes(property.toLowerCase()))
+    const sourceProperty =
+      propertyIndex >= 0 && propertyIndex < sourceWords.length - 1 ? sourceWords[propertyIndex + 1] : sourceWords[0]
+
+    const matchingItems = targetItems.filter((item) => {
+      const targetWords = item.name
+        .toLowerCase()
+        .split(/[\s\-_]+/)
+        .filter((word: string) => word.length > 0)
+      const targetPropertyIndex = targetWords.findIndex((word: string) => word.includes(property.toLowerCase()))
+      const targetProperty =
+        targetPropertyIndex >= 0 && targetPropertyIndex < targetWords.length - 1
+          ? targetWords[targetPropertyIndex + 1]
+          : targetWords[0]
+      return sourceProperty === targetProperty
+    })
+
+    if (matchingItems.length > 0) {
+      return matchingItems[Math.floor(Math.random() * matchingItems.length)]
+    }
+    return null
+  }
+
+  // Advanced matching: apply all (manual, then rules) with fixpoint passes
+  const getRuleCandidates = (rule: TraitMatchingRule, sourceItem: LayerItem, targetLayer: Layer): LayerItem[] => {
+    if (rule.property.toLowerCase() === "color") {
+      const fam = colorFamilyFromName(sourceItem.name)
+      if (!fam) return []
+      return targetLayer.items.filter((it) => colorFamilyFromName(it.name) === fam)
+    }
+    if (rule.property === "name") {
+      const srcPrefix = sourceItem.name.split(/[-_]/)[0].toLowerCase().trim()
+      return targetLayer.items.filter((it) => it.name.split(/[-_]/)[0].toLowerCase().trim() === srcPrefix)
+    }
+    const srcWords = sourceItem.name
+      .toLowerCase()
+      .split(/[\s\-_]+/)
+      .filter(Boolean)
+    const idx = srcWords.findIndex((w) => w.includes(rule.property.toLowerCase()))
+    const srcProp = idx >= 0 && idx < srcWords.length - 1 ? srcWords[idx + 1] : srcWords[0]
+    return targetLayer.items.filter((it) => {
+      const words = it.name
+        .toLowerCase()
+        .split(/[\s\-_]+/)
+        .filter(Boolean)
+      const i = words.findIndex((w) => w.includes(rule.property.toLowerCase()))
+      const val = i >= 0 && i < words.length - 1 ? words[i + 1] : words[0]
+      return val === srcProp
+    })
+  }
+
+  const chooseCandidateBalanced = (
+    candidates: LayerItem[],
+    targetLayer: Layer,
+    opts: { rule?: TraitMatchingRule; sourceItemId?: number; respectQuotas: boolean },
+  ): LayerItem | null => {
+    if (candidates.length === 0) return null
+
+    const weights = candidates.map((cand) => {
+      const quotaRem =
+        opts.respectQuotas && targetLayer.exactCountMode
+          ? Math.max(0, quotasRef.current[quotaKey(targetLayer.id, cand.id)] || 0)
+          : 1
+
+      let pairKey: string | null = null
+      if (opts.rule && opts.sourceItemId != null) {
+        pairKey = rulePairKey(opts.rule.id, opts.sourceItemId, targetLayer.id, cand.id)
+      }
+      const pairUsed = pairKey ? pairUsageRef.current[pairKey] || 0 : 0
+
+      const tLayerStats = traitUsageStats[targetLayer.id] || {}
+      const tUsage = tLayerStats[cand.id] || 0
+      const avgT = Object.values(tLayerStats).reduce((s, c) => s + c, 0) / Math.max(1, targetLayer.items.length)
+      const usageBoost = avgT > 0 && tUsage < avgT ? 1 + ((avgT - tUsage) / avgT) * 1.5 : tUsage === 0 ? 2 : 1
+
+      const score = (Math.max(0.001, quotaRem) * usageBoost) / (1 + pairUsed)
+      return Math.max(0.0001, score)
+    })
+
+    const total = weights.reduce((s, w) => s + w, 0)
+    let r = Math.random() * total
+    for (let i = 0; i < candidates.length; i++) {
+      r -= weights[i]
+      if (r <= 0) return candidates[i]
+    }
+    return candidates[candidates.length - 1]
+  }
+
+  const applyAllMatching = (
+    selected: Record<number, number>,
+    respectQuotas: boolean,
+  ): { changed: boolean; selected: Record<number, number> } => {
+    let changed = false
+    const effectiveRules = getEffectiveMatchingRules()
+
+    const respectsExclusions = (candidateSelected: Record<number, number>) => {
+      for (const rule of traitExclusionRules) {
+        const sId = candidateSelected[rule.sourceLayerId]
+        const tId = candidateSelected[rule.targetLayerId]
+        if (!sId || !tId) continue
+        if (rule.sourceItemId && rule.targetItemId) {
+          if (sId === rule.sourceItemId && tId === rule.targetItemId) return false
+        } else if (rule.property) {
+          const sLayer = layers.find((l) => l.id === rule.sourceLayerId)
+          const tLayer = layers.find((l) => l.id === rule.targetLayerId)
+          const sItem = sLayer?.items.find((i) => i.id === sId)
+          const tItem = tLayer?.items.find((i) => i.id === tId)
+          if (sItem && tItem) {
+            const sp = extractProperty(sItem.name, rule.property)
+            const tp = extractProperty(tItem.name, rule.property)
+            if (sp.toLowerCase() === tp.toLowerCase()) return false
+          }
+        }
+      }
+      return true
+    }
+
+    for (let pass = 0; pass < 3; pass++) {
+      let passChanged = false
+
+      // Manual mappings (hard constraints)
+      for (const mapping of manualMappings) {
+        const srcAssigned = selected[mapping.sourceLayerId]
+        if (srcAssigned === mapping.sourceItemId) {
+          if (selected[mapping.targetLayerId] === undefined) {
+            if (
+              !respectQuotas ||
+              !layers.find((l) => l.id === mapping.targetLayerId)?.exactCountMode ||
+              (quotasRef.current[quotaKey(mapping.targetLayerId, mapping.targetItemId)] || 0) > 0
+            ) {
+              const proposal = { ...selected, [mapping.targetLayerId]: mapping.targetItemId }
+              if (respectsExclusions(proposal)) {
+                selected[mapping.targetLayerId] = mapping.targetItemId
+                const key = mapPairKey(mapping.sourceItemId, mapping.targetLayerId, mapping.targetItemId)
+                pairUsageRef.current[key] = (pairUsageRef.current[key] || 0) + 1
+                passChanged = true
+              }
+            }
+          }
+        }
+      }
+
+      // Property-based rules
+      for (const rule of effectiveRules) {
+        const srcItemId = selected[rule.sourceLayerId]
+        if (!srcItemId) continue
+        if (selected[rule.targetLayerId] !== undefined) continue
+
+        const srcLayer = layers.find((l) => l.id === rule.sourceLayerId)
+        const tgtLayer = layers.find((l) => l.id === rule.targetLayerId)
+        if (!srcLayer || !tgtLayer) continue
+
+        const srcItem = srcLayer.items.find((i) => i.id === srcItemId)
+        if (!srcItem) continue
+
+        const candidatesRaw = getRuleCandidates(rule, srcItem, tgtLayer)
+        if (candidatesRaw.length === 0) continue
+
+        const candidates = candidatesRaw.filter((cand) => {
+          if (!respectQuotas || !tgtLayer.exactCountMode) return true
+          return (quotasRef.current[quotaKey(tgtLayer.id, cand.id)] || 0) > 0
+        })
+        if (candidates.length === 0) continue
+
+        const chosen = chooseCandidateBalanced(candidates, tgtLayer, {
+          rule,
+          sourceItemId: srcItem.id,
+          respectQuotas,
+        })
+        if (!chosen) continue
+
+        const proposal = { ...selected, [tgtLayer.id]: chosen.id }
+        if (!respectsExclusions(proposal)) continue
+
+        selected[tgtLayer.id] = chosen.id
+        const pKey = rulePairKey(rule.id, srcItem.id, tgtLayer.id, chosen.id)
+        pairUsageRef.current[pKey] = (pairUsageRef.current[pKey] || 0) + 1
+        passChanged = true
+      }
+
+      if (!passChanged) break
+      changed = changed || passChanged
+    }
+
+    return { changed, selected }
+  }
+
+  // Random combination (weighted)
   const generateRandomCombination = (useBalancing = false): Record<number, number> => {
     const combination: Record<number, number> = {}
-
     layers.forEach((layer) => {
       if (layer.items.length > 0) {
         const selectedItem = selectWeightedRandom(layer.items, layer.id, useBalancing)
@@ -998,71 +1026,99 @@ export default function NFTLayerViewer() {
         }
       }
     })
-
     return combination
   }
 
-  const generateValidCombination = (useBalancing = false): Record<number, number> => {
-    const maxAttempts = 200
+  // Quotas checks
+  const combinationRespectsQuotas = (combo: Record<number, number>): boolean => {
+    for (const layer of layers) {
+      if (!layer.exactCountMode) continue
+      const itemId = combo[layer.id]
+      if (!itemId) return false
+      const rem = quotasRef.current[quotaKey(layer.id, itemId)] || 0
+      if (rem <= 0) return false
+    }
+    return true
+  }
+
+  const decrementQuotasForCombination = (combo: Record<number, number>) => {
+    for (const layer of layers) {
+      if (!layer.exactCountMode) continue
+      const itemId = combo[layer.id]
+      if (!itemId) continue
+      const key = quotaKey(layer.id, itemId)
+      quotasRef.current[key] = Math.max(0, (quotasRef.current[key] || 0) - 1)
+    }
+  }
+
+  // Selection change in preview
+  const handleSelectionChange = (next: Record<number, number>) => {
+    const updated = { ...next }
+    applyAllMatching(updated, false)
+    setSelectedItems(updated)
+  }
+
+  // Valid combination generator
+  const generateValidCombination = (useBalancing = false, respectQuotas = false): Record<number, number> => {
+    const maxAttempts = 400
     let attempts = 0
+
+    const effectiveRules = getEffectiveMatchingRules()
+    const sourceLayerIds = new Set([
+      ...effectiveRules.map((r) => r.sourceLayerId),
+      ...manualMappings.map((m) => m.sourceLayerId),
+    ])
 
     while (attempts < maxAttempts) {
       attempts++
-      console.log(`\n--- 🔄 Generation Attempt #${attempts} ---`)
       const combination: Record<number, number> = {}
-      const processedLayers = new Set<number>()
 
-      // Step 1: Identify source layers (those that drive matching)
-      const sourceLayerIds = new Set([...traitMatchingRules, ...manualMappings].map((rule) => rule.sourceLayerId))
-
-      // Step 2: Process source layers first, prioritizing those with fewer items
+      // Source layers first
       const sourceLayers = layers
         .filter((l) => sourceLayerIds.has(l.id))
         .sort((a, b) => a.items.length - b.items.length)
 
       for (const sourceLayer of sourceLayers) {
-        if (processedLayers.has(sourceLayer.id)) continue
-
-        const item = selectWeightedRandom(sourceLayer.items, sourceLayer.id, useBalancing)
-        if (item) {
-          combination[sourceLayer.id] = item.id
-          processedLayers.add(sourceLayer.id)
-          console.log(`🎯 Source Layer [${sourceLayer.name}]: Picked "${item.name}"`)
-
-          // Apply matching rules immediately
-          applyMatchingRules(sourceLayer.id, item.id, combination)
-          // Mark target layers of applied rules as processed
-          traitMatchingRules
-            .filter((r) => r.sourceLayerId === sourceLayer.id)
-            .forEach((r) => processedLayers.add(r.targetLayerId))
-          manualMappings
-            .filter((m) => m.sourceLayerId === sourceLayer.id)
-            .forEach((m) => processedLayers.add(m.targetLayerId))
+        let item: LayerItem | null = null
+        if (sourceLayer.exactCountMode && respectQuotas) {
+          item = selectWithQuota(sourceLayer)
+        } else {
+          item = selectWeightedRandom(sourceLayer.items, sourceLayer.id, useBalancing)
         }
+        if (!item) continue
+        combination[sourceLayer.id] = item.id
+
+        // Apply rules after setting a source selection
+        applyAllMatching(combination, respectQuotas)
       }
 
-      // Step 3: Process remaining "free" layers
-      const freeLayers = layers.filter((l) => !processedLayers.has(l.id))
+      // Fill remaining layers
+      const freeLayers = layers.filter((l) => combination[l.id] === undefined)
       for (const layer of freeLayers) {
-        const item = selectWeightedRandom(layer.items, layer.id, useBalancing)
+        let item: LayerItem | null = null
+        if (layer.exactCountMode && respectQuotas) {
+          item = selectWithQuota(layer)
+        } else {
+          item = selectWeightedRandom(layer.items, layer.id, useBalancing)
+        }
         if (item) {
           combination[layer.id] = item.id
-          console.log(`🆓 Free Layer [${layer.name}]: Picked "${item.name}"`)
         }
       }
 
-      // Step 4: Validate against exclusion rules
+      // Final pass to catch cascades
+      applyAllMatching(combination, respectQuotas)
+
+      // Exclusion validation
       let isValid = true
       for (const rule of traitExclusionRules) {
         const sourceItemId = combination[rule.sourceLayerId]
         const targetItemId = combination[rule.targetLayerId]
-
         if (!sourceItemId || !targetItemId) continue
 
         if (rule.sourceItemId && rule.targetItemId) {
           if (sourceItemId === rule.sourceItemId && targetItemId === rule.targetItemId) {
             isValid = false
-            console.log(`❌ Exclusion VIOLATION: "${rule.sourceItemName}" + "${rule.targetItemName}"`)
             break
           }
         } else if (rule.property) {
@@ -1076,36 +1132,49 @@ export default function NFTLayerViewer() {
             const targetProperty = extractProperty(targetItem.name, rule.property)
             if (sourceProperty.toLowerCase() === targetProperty.toLowerCase()) {
               isValid = false
-              console.log(
-                `❌ Exclusion VIOLATION: Property "${rule.property}" match between "${sourceItem.name}" and "${targetItem.name}"`,
-              )
               break
             }
           }
         }
       }
 
+      if (isValid && respectQuotas && !combinationRespectsQuotas(combination)) {
+        isValid = false
+      }
+
+      // Head/Body cohesion
       if (isValid) {
-        console.log(`✅--- Valid Combination Found (Attempt ${attempts}) ---✅`)
+        const fixed = tryFixBodyToMatchHead(combination, respectQuotas)
+        if (!fixed || !isHeadBodyCoherent(combination)) {
+          isValid = false
+        }
+      }
+
+      if (isValid) {
         return combination
       }
     }
 
-    console.warn(`⚠️ Max attempts reached. Returning a random combination as a fallback.`)
-    return generateRandomCombination(useBalancing)
+    return {}
   }
 
+  // Preview actions
   const generateWithRules = useCallback(() => {
     if (layers.length === 0) {
+      toast({ title: "Error", description: "No layers added yet", variant: "destructive" })
+      return
+    }
+
+    const combination = generateValidCombination(true, false)
+    if (Object.keys(combination).length === 0) {
       toast({
-        title: "Error",
-        description: "No layers added yet",
+        title: "No Combination",
+        description: "Could not find a valid combination with current rules/quotas.",
         variant: "destructive",
       })
       return
     }
 
-    const combination = generateValidCombination(true) // Use balancing
     updateTraitUsage(combination)
     setSelectedItems(combination)
 
@@ -1113,19 +1182,15 @@ export default function NFTLayerViewer() {
       title: "Success",
       description: "Random combination with rules generated (balanced)",
     })
-  }, [layers, traitMatchingRules, traitExclusionRules, toast])
+  }, [layers, toast])
 
   const generateRandom = useCallback(() => {
     if (layers.length === 0) {
-      toast({
-        title: "Error",
-        description: "No layers added yet",
-        variant: "destructive",
-      })
+      toast({ title: "Error", description: "No layers added yet", variant: "destructive" })
       return
     }
 
-    const combination = generateRandomCombination(true) // Use balancing
+    const combination = generateRandomCombination(true)
     updateTraitUsage(combination)
     setSelectedItems(combination)
 
@@ -1135,6 +1200,7 @@ export default function NFTLayerViewer() {
     })
   }, [layers, toast])
 
+  // Uniqueness estimation (sample)
   const calculateUniqueness = useCallback(() => {
     if (layers.length === 0) {
       toast({
@@ -1145,47 +1211,43 @@ export default function NFTLayerViewer() {
       return
     }
 
-    // Calculate total theoretical combinations
     const layersWithItems = layers.filter((layer) => layer.items.length > 0)
     let totalTheoreticalCombinations = 1
     layersWithItems.forEach((layer) => {
       totalTheoreticalCombinations *= layer.items.length
     })
 
-    // Generate a sample of actual combinations to test constraints
     const sampleSize = Math.min(10000, totalTheoreticalCombinations)
     const validCombinations = new Set<string>()
-    const maxAttempts = sampleSize * 3 // Allow more attempts to find valid combinations
+    const maxAttempts = sampleSize * 3
 
     let attempts = 0
     while (validCombinations.size < sampleSize && attempts < maxAttempts) {
       attempts++
-
-      // Generate a random combination
       const combination: Record<number, number> = {}
       layersWithItems.forEach((layer) => {
         if (layer.items.length > 0) {
           const selectedItem = selectWeightedRandom(layer.items, layer.id)
-          combination[layer.id] = selectedItem.id
+          if (selectedItem) combination[layer.id] = selectedItem.id
         }
       })
 
-      // Check if combination violates exclusion rules
+      // Apply rules
+      applyAllMatching(combination, false)
+
+      // Check exclusion rules
       let isValidCombination = true
       for (const rule of traitExclusionRules) {
         const sourceItemId = combination[rule.sourceLayerId]
         const targetItemId = combination[rule.targetLayerId]
-
         if (!sourceItemId || !targetItemId) continue
 
         if (rule.sourceItemId && rule.targetItemId) {
-          // Specific item exclusion
           if (sourceItemId === rule.sourceItemId && targetItemId === rule.targetItemId) {
             isValidCombination = false
             break
           }
         } else if (rule.property) {
-          // Property-based exclusion
           const sourceLayer = layers.find((l) => l.id === rule.sourceLayerId)
           const targetLayer = layers.find((l) => l.id === rule.targetLayerId)
           const sourceItem = sourceLayer?.items.find((i) => i.id === sourceItemId)
@@ -1194,7 +1256,6 @@ export default function NFTLayerViewer() {
           if (sourceItem && targetItem) {
             const sourceProperty = extractProperty(sourceItem.name, rule.property)
             const targetProperty = extractProperty(targetItem.name, rule.property)
-
             if (sourceProperty.toLowerCase() === targetProperty.toLowerCase()) {
               isValidCombination = false
               break
@@ -1204,65 +1265,17 @@ export default function NFTLayerViewer() {
       }
 
       if (isValidCombination) {
-        // Apply matching rules to get the final combination
-        const finalCombination = { ...combination }
-        const sourceLayers = new Set(traitMatchingRules.map((rule) => rule.sourceLayerId))
-
-        layersWithItems.forEach((layer) => {
-          if (sourceLayers.has(layer.id) && finalCombination[layer.id]) {
-            applyMatchingRules(layer.id, finalCombination[layer.id], finalCombination)
-          }
-        })
-
-        // Apply manual mappings
-        layersWithItems.forEach((layer) => {
-          if (finalCombination[layer.id]) {
-            const relevantMappings = manualMappings.filter(
-              (mapping) => mapping.sourceLayerId === layer.id && mapping.sourceItemId === finalCombination[layer.id],
-            )
-            relevantMappings.forEach((mapping) => {
-              finalCombination[mapping.targetLayerId] = mapping.targetItemId
-            })
-          }
-        })
-
-        // Create hash for the final combination
-        const hash = createCombinationHash(finalCombination)
+        const hash = createCombinationHash(combination)
         validCombinations.add(hash)
       }
     }
 
-    // Calculate actual possible combinations
-    let estimatedTotalValid
-    if (validCombinations.size === sampleSize && attempts < maxAttempts) {
-      // We found the full sample without hitting max attempts, so there are likely more
-      estimatedTotalValid = totalTheoreticalCombinations
-    } else {
-      // Estimate based on success rate
-      const successRate = validCombinations.size / attempts
-      estimatedTotalValid = Math.round(totalTheoreticalCombinations * successRate)
-    }
+    const estimatedTotalValid =
+      validCombinations.size === sampleSize && attempts < maxAttempts
+        ? totalTheoreticalCombinations
+        : Math.round(totalTheoreticalCombinations * (validCombinations.size / Math.max(1, attempts)))
 
-    // Calculate uniqueness percentage
     const uniquenessPercentage = Math.min(100, (estimatedTotalValid / Math.max(1, totalTheoreticalCombinations)) * 100)
-
-    // Detailed breakdown
-    const breakdown = {
-      totalTheoreticalCombinations,
-      estimatedValidCombinations: estimatedTotalValid,
-      sampledValidCombinations: validCombinations.size,
-      sampleSize: Math.min(sampleSize, attempts),
-      exclusionRules: traitExclusionRules.length,
-      matchingRules: traitMatchingRules.length,
-      manualMappings: manualMappings.length,
-      layerBreakdown: layersWithItems.map((layer) => ({
-        name: layer.name,
-        itemCount: layer.items.length,
-        items: layer.items.map((item) => item.name),
-      })),
-    }
-
-    console.log("Uniqueness Calculation Breakdown:", breakdown)
 
     setUniquenessData({
       totalCombinations: estimatedTotalValid,
@@ -1273,7 +1286,7 @@ export default function NFTLayerViewer() {
       title: "Success",
       description: `Found ${validCombinations.size} unique combinations in sample of ${Math.min(sampleSize, attempts)}`,
     })
-  }, [layers, traitMatchingRules, traitExclusionRules, manualMappings, toast])
+  }, [layers, traitExclusionRules, toast])
 
   const updateItemRarity = useCallback((layerId: number, itemId: number, rarity: number) => {
     setLayers((prev) =>
@@ -1287,6 +1300,25 @@ export default function NFTLayerViewer() {
         return layer
       }),
     )
+  }, [])
+
+  const updateItemCount = useCallback((layerId: number, itemId: number, nextCount: number) => {
+    const safe = Math.max(0, Math.floor(nextCount) || 0)
+    setLayers((prev) =>
+      prev.map((layer) => {
+        if (layer.id === layerId) {
+          return {
+            ...layer,
+            items: layer.items.map((item) => (item.id === itemId ? { ...item, count: safe } : item)),
+          }
+        }
+        return layer
+      }),
+    )
+  }, [])
+
+  const setLayerExactMode = useCallback((layerId: number, enabled: boolean) => {
+    setLayers((prev) => prev.map((layer) => (layer.id === layerId ? { ...layer, exactCountMode: enabled } : layer)))
   }, [])
 
   const applyRarityPreset = useCallback(
@@ -1346,7 +1378,55 @@ export default function NFTLayerViewer() {
     return sortedKeys.map((key) => `${key}:${combination[Number(key)]}`).join("|")
   }
 
-  // Enhanced batch generation with progress tracking and cancellation support
+  // Compute starting quotas for exact-count layers
+  function computeInitialQuotas(totalExportCount: number): Record<string, number> {
+    const result: Record<string, number> = {}
+
+    const scaleCountsToTotal = (counts: number[], total: number) => {
+      const sum = counts.reduce((s, c) => s + c, 0)
+      if (sum === 0) return counts.map(() => 0)
+      const raw = counts.map((c) => (c / sum) * total)
+      const floored = raw.map((x) => Math.floor(x))
+      let remainder = total - floored.reduce((s, x) => s + x, 0)
+      const fracIdx = raw
+        .map((x, i) => ({ i, f: x - Math.floor(x) }))
+        .sort((a, b) => b.f - a.f)
+        .map((e) => e.i)
+      let idx = 0
+      while (remainder > 0 && idx < fracIdx.length) {
+        floored[fracIdx[idx]] += 1
+        remainder--
+        idx++
+        if (idx >= fracIdx.length) idx = 0
+      }
+      return floored
+    }
+
+    for (const layer of layers) {
+      if (!layer.exactCountMode) continue
+      const counts = layer.items.map((it) => Math.max(0, Math.floor(it.count || 0)))
+      const sum = counts.reduce((s, c) => s + c, 0)
+
+      let finalCounts = counts
+      if (sum !== totalExportCount) {
+        finalCounts = scaleCountsToTotal(counts, totalExportCount)
+        const before = sum
+        const after = finalCounts.reduce((s, c) => s + c, 0)
+        toast({
+          title: "Counts Scaled",
+          description: `Layer "${layer.name}" counts (${before}) auto-scaled to match export size (${after}).`,
+        })
+      }
+
+      layer.items.forEach((it, idx) => {
+        result[quotaKey(layer.id, it.id)] = finalCounts[idx]
+      })
+    }
+
+    return result
+  }
+
+  // Batch generation core
   const generateBatchCombinations = async (
     batchSize: number,
     useRules: boolean,
@@ -1354,72 +1434,83 @@ export default function NFTLayerViewer() {
   ): Promise<Record<number, number>[]> => {
     const combinations: Record<number, number>[] = []
     const batchHashes = new Set<string>()
-    const maxAttempts = batchSize * 15 // Increased attempts for better success rate
+    const maxAttempts = batchSize * 30
 
     let attempts = 0
     let lastProgressUpdate = Date.now()
 
     while (combinations.length < batchSize && attempts < maxAttempts) {
-      // Check for cancellation
-      if (signal?.aborted) {
-        console.log("Batch generation cancelled")
-        throw new Error("Generation cancelled")
-      }
-
+      if (signal?.aborted) throw new Error("Generation cancelled")
       attempts++
 
-      // Update progress more frequently and with details
       const now = Date.now()
       if (now - lastProgressUpdate > 100) {
-        // Update every 100ms
         const progress = Math.round((combinations.length / batchSize) * 100)
         setExportProgress(progress)
         setProgressDetails(`Generated ${combinations.length} of ${batchSize} NFTs (${attempts} attempts)`)
         lastProgressUpdate = now
       }
 
-      let combination: Record<number, number>
+      let combination: Record<number, number> = {}
 
       try {
         if (useRules) {
-          combination = generateValidCombination(true)
+          combination = generateValidCombination(true, true)
         } else {
-          combination = generateRandomCombination(true)
+          // Even without rules, still respect quotas and then apply rules (non-blocking) to fill targets
+          combination = {}
+          for (const layer of layers) {
+            let item: LayerItem | null = null
+            if (layer.exactCountMode) item = selectWithQuota(layer)
+            else item = selectWeightedRandom(layer.items, layer.id, true)
+            if (item) combination[layer.id] = item.id
+          }
+          applyAllMatching(combination, true)
         }
+
+        if (Object.keys(combination).length === 0) continue
 
         const hash = createCombinationHash(combination)
-
-        // Check against both batch duplicates and global duplicates
         if (!batchHashes.has(hash) && !generatedCombinations.has(hash)) {
-          combinations.push(combination)
-          batchHashes.add(hash)
-          updateTraitUsage(combination)
+          if (combinationRespectsQuotas(combination)) {
+            combinations.push(combination)
+            batchHashes.add(hash)
+            updateTraitUsage(combination)
+            decrementQuotasForCombination(combination)
+          }
         }
-      } catch (error) {
-        console.warn("Error generating combination:", error)
+      } catch {
+        // ignore and continue
         continue
       }
 
-      // Yield control periodically to prevent freezing
-      if (attempts % 25 === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1))
-      }
+      if (attempts % 25 === 0) await new Promise((resolve) => setTimeout(resolve, 1))
     }
 
     // Update global generated combinations
     setGeneratedCombinations((prev) => new Set([...prev, ...batchHashes]))
 
-    console.log(`Generated ${combinations.length} combinations in ${attempts} attempts`)
+    // Persist quotas/pair usage to session if active
+    if (exportSession) {
+      setExportSession({
+        ...exportSession,
+        quotas: { ...quotasRef.current },
+        pairUsage: { ...pairUsageRef.current },
+        timestamp: Date.now(),
+      })
+    }
+
     return combinations
   }
 
-  // Enhanced download function with better progress tracking
   const downloadBatch = async (batchData: BatchData) => {
+    if (isDownloadingRef.current || batchStatus === "downloading") return
+    isDownloadingRef.current = true
+
     setBatchStatus("downloading")
     setExportProgress(0)
     setProgressDetails("Initializing download...")
 
-    // Create abort controller for this download
     const abortController = new AbortController()
     abortControllerRef.current = abortController
 
@@ -1429,14 +1520,9 @@ export default function NFTLayerViewer() {
       const imagesFolder = zip.folder("images")
       const metadataFolder = zip.folder("metadata")
 
-      console.log(`Creating ZIP for batch ${batchData.batchNumber} with ${batchData.combinations.length} NFTs`)
-
       for (let i = 0; i < batchData.combinations.length; i++) {
-        if (abortController.signal.aborted) {
-          throw new Error("Download cancelled")
-        }
+        if (abortController.signal.aborted) throw new Error("Download cancelled")
 
-        // Update progress during NFT generation (0-80%)
         const nftProgress = Math.round((i / batchData.combinations.length) * 80)
         setExportProgress(nftProgress)
         setProgressDetails(`Generating NFT ${i + 1} of ${batchData.combinations.length}...`)
@@ -1445,14 +1531,13 @@ export default function NFTLayerViewer() {
         const nftNumber = batchData.startingNumber + i
 
         try {
-          // Create canvas with optimized settings
           const canvas = document.createElement("canvas")
           canvas.width = batchData.imageSize
           canvas.height = batchData.imageSize
           const ctx = canvas.getContext("2d", {
             alpha: false,
             willReadFrequently: false,
-            desynchronized: true, // Better performance
+            desynchronized: true,
           })!
 
           ctx.fillStyle = "white"
@@ -1460,7 +1545,6 @@ export default function NFTLayerViewer() {
 
           const sortedLayers = layers.filter((layer) => combination[layer.id]).sort((a, b) => a.zIndex - b.zIndex)
 
-          // Load and draw images with better error handling
           for (const layer of sortedLayers) {
             const itemId = combination[layer.id]
             const item = layer.items.find((i) => i.id === itemId)
@@ -1468,10 +1552,7 @@ export default function NFTLayerViewer() {
 
             await new Promise<void>((resolve, reject) => {
               const img = new Image()
-              const timeout = setTimeout(() => {
-                reject(new Error(`Timeout loading image for ${item.name}`))
-              }, 10000) // 10 second timeout
-
+              const timeout = setTimeout(() => reject(new Error(`Timeout loading image for ${item.name}`)), 10000)
               img.onload = () => {
                 clearTimeout(timeout)
                 try {
@@ -1481,18 +1562,14 @@ export default function NFTLayerViewer() {
                   reject(error)
                 }
               }
-              img.onerror = () => {
-                clearTimeout(timeout)
-                reject(new Error(`Failed to load image for ${item.name}`))
-              }
+              img.onerror = () => reject(new Error(`Failed to load image for ${item.name}`))
               img.crossOrigin = "anonymous"
               img.src = item.dataUrl
             })
           }
 
-          // Convert to blob with optimized quality
           const blob = await new Promise<Blob>((resolve) => {
-            canvas.toBlob((blob) => resolve(blob!), "image/png", 0.8) // Reduced quality for speed
+            canvas.toBlob((blob) => resolve(blob!), "image/png", 0.8)
           })
 
           imagesFolder?.file(`${nftNumber}.png`, blob)
@@ -1514,28 +1591,21 @@ export default function NFTLayerViewer() {
 
           metadataFolder?.file(`${nftNumber}.json`, JSON.stringify(metadata, null, 2))
 
-          // Clean up canvas
           canvas.width = 1
           canvas.height = 1
 
-          // Yield control every 5 NFTs
           if (i % 5 === 0 && i > 0) {
             await new Promise((resolve) => setTimeout(resolve, 10))
           }
         } catch (error) {
           console.error(`Error generating NFT ${nftNumber}:`, error)
-          // Continue with next NFT instead of failing entire batch
         }
       }
 
-      if (abortController.signal.aborted) {
-        throw new Error("Download cancelled")
-      }
+      if (abortController.signal.aborted) throw new Error("Download cancelled")
 
-      // Update progress for ZIP creation (80-95%)
       setExportProgress(82)
       setProgressDetails("Preparing ZIP file...")
-      console.log(`Finished generating ${batchData.combinations.length} NFTs, starting ZIP creation...`)
 
       const endNumber = batchData.startingNumber + batchData.combinations.length - 1
 
@@ -1561,16 +1631,14 @@ IPFS Instructions:
 
       setExportProgress(85)
       setProgressDetails("Creating ZIP file...")
-      console.log("Creating ZIP file...")
 
       const zipContent = await zip.generateAsync(
         {
           type: "blob",
-          compression: "STORE", // No compression for speed
-          streamFiles: false, // Disable streaming for faster generation
+          compression: "STORE",
+          streamFiles: false,
         },
         (metadata) => {
-          // Update progress during ZIP creation (85-98%)
           const zipProgress = 85 + metadata.percent * 0.13
           setExportProgress(Math.round(zipProgress))
           setProgressDetails(`Creating ZIP file... ${metadata.percent.toFixed(1)}%`)
@@ -1579,7 +1647,6 @@ IPFS Instructions:
 
       setExportProgress(99)
       setProgressDetails("Starting download...")
-      console.log("ZIP created, starting download...")
 
       const url = URL.createObjectURL(zipContent)
       const a = document.createElement("a")
@@ -1588,19 +1655,19 @@ IPFS Instructions:
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
-
       setTimeout(() => {
         URL.revokeObjectURL(url)
       }, 5000)
 
-      // Update session state
       const updatedCompletedBatches = [...completedBatches, batchData.batchNumber]
       setCompletedBatches(updatedCompletedBatches)
       setBatchStatus("completed")
       setExportProgress(100)
       setProgressDetails("Download completed!")
 
-      // Update export session
+      // Increment currentBatch after successful download
+      setCurrentBatch((prev) => prev + 1)
+
       if (exportSession) {
         const updatedSession: ExportSession = {
           ...exportSession,
@@ -1608,11 +1675,12 @@ IPFS Instructions:
           status: currentBatch >= totalBatches ? "completed" : "completed",
           generatedCombinations: Array.from(generatedCombinations),
           timestamp: Date.now(),
+          quotas: { ...quotasRef.current },
+          pairUsage: { ...pairUsageRef.current },
         }
         setExportSession(updatedSession)
       }
 
-      // Play notification sound
       playNotificationSound()
 
       toast({
@@ -1620,78 +1688,81 @@ IPFS Instructions:
         description: `Batch ${batchData.batchNumber} downloaded successfully! (NFTs ${batchData.startingNumber}-${endNumber})`,
       })
 
-      // Auto-continue to next batch if enabled and not the last batch
-      if (autoDownload && currentBatch < totalBatches) {
+      if (autoDownload && currentBatchRef.current < totalBatches) {
         setTimeout(() => {
           generateNextBatch()
-        }, 2000) // 2 second delay before next batch
+        }, 2000)
       }
     } catch (error) {
       console.error("Download error:", error)
-      if (error instanceof Error && error.message === "Download cancelled") {
-        setBatchStatus("ready")
-        setProgressDetails("Download cancelled")
-        toast({
-          title: "Cancelled",
-          description: "Download was cancelled",
-          variant: "destructive",
-        })
-      } else {
-        toast({
-          title: "Error",
-          description: `Failed to download batch ${batchData.batchNumber}: ${error}`,
-          variant: "destructive",
-        })
-        setBatchStatus("ready") // Reset to ready state on error
-      }
+      setBatchStatus("ready")
+      setProgressDetails(error instanceof Error ? error.message : "Download error")
+      toast({
+        title: "Error",
+        description: `Failed to download batch ${batchData.batchNumber}.`,
+        variant: "destructive",
+      })
     } finally {
       abortControllerRef.current = null
+      isDownloadingRef.current = false
     }
   }
 
   const generateNextBatch = async () => {
     if (!exportConfig) return
+    if (isGeneratingRef.current || batchStatus === "generating") return
+    if (currentBatch >= totalBatches) {
+      setBatchStatus("completed")
+      return
+    }
 
-    const nextBatchNumber = currentBatch + 1
-    const remainingNFTs = exportConfig.totalCount - completedBatches.length * exportConfig.batchSize
-    const currentBatchSize = Math.min(exportConfig.batchSize, remainingNFTs)
-    const startingNumber = (nextBatchNumber - 1) * exportConfig.batchSize + 1
+    isGeneratingRef.current = true
 
-    setCurrentBatch(nextBatchNumber)
+    // FIXED: Calculate based on currentBatch - 1 (batches that should be completed)
+    const completedNFTs = (currentBatch - 1) * exportConfig.batchSize
+    const startingNumber = completedNFTs + 1
+    const remainingNFTs = exportConfig.totalCount - completedNFTs
+
+    console.log(`DEBUG: Current batch: ${currentBatch}`)
+    console.log(`DEBUG: Batches processed: ${currentBatch - 1}`)
+    console.log(`DEBUG: Completed NFTs: ${completedNFTs}`)
+    console.log(`DEBUG: Starting number: ${startingNumber}`)
+    console.log(`DEBUG: Remaining NFTs: ${remainingNFTs}`)
+
     setBatchStatus("generating")
     setExportProgress(0)
-    setProgressDetails("Starting batch generation...")
+    setProgressDetails(`Starting batch ${currentBatch + 1} generation...`)
 
-    console.log(`Generating batch ${nextBatchNumber} with ${currentBatchSize} NFTs`)
-
-    // Create abort controller for this generation
     const abortController = new AbortController()
     abortControllerRef.current = abortController
 
-    // Update export session
     if (exportSession) {
-      const updatedSession: ExportSession = {
+      setExportSession({
         ...exportSession,
-        currentBatch: nextBatchNumber,
+        currentBatch: currentBatch + 1,
         status: "generating",
         timestamp: Date.now(),
-      }
-      setExportSession(updatedSession)
+        quotas: { ...quotasRef.current },
+        pairUsage: { ...pairUsageRef.current },
+      })
     }
 
     try {
       const combinations = await generateBatchCombinations(
-        currentBatchSize,
+        Math.min(exportConfig.batchSize, remainingNFTs),
         exportConfig.useRules,
         abortController.signal,
       )
 
-      if (combinations.length === 0) {
+      if (combinations.length !== Math.min(exportConfig.batchSize, remainingNFTs)) {
         toast({
-          title: "Error",
-          description: `Could not generate enough unique combinations for batch ${nextBatchNumber}`,
-          variant: "destructive",
+          title: "Warning",
+          description:
+            "Could not generate the full batch with current rules/quotas. Consider adjusting counts or rules.",
         })
+      }
+
+      if (combinations.length === 0) {
         setBatchExportMode(false)
         clearExportSession()
         return
@@ -1699,54 +1770,59 @@ IPFS Instructions:
 
       const batchData: BatchData = {
         combinations,
-        batchNumber: nextBatchNumber,
+        batchNumber: currentBatch + 1,
         collectionName: exportConfig.collectionName,
         imageSize: exportConfig.imageSize,
         startingNumber,
       }
 
+      console.log(`DEBUG: Created batch data for batch ${currentBatch + 1} with starting number ${startingNumber}`)
+      console.log(
+        `DEBUG: This batch will generate NFTs ${startingNumber} to ${startingNumber + combinations.length - 1}`,
+      )
+
       setCurrentBatchData(batchData)
       setBatchStatus("ready")
       setExportProgress(100)
-      setProgressDetails(`Batch ${nextBatchNumber} ready for download`)
+      setProgressDetails(`Batch ${currentBatch + 1} ready for download`)
 
-      // Update export session with batch data
-      const updatedSession: ExportSession = {
-        ...exportSession,
-        status: "ready",
-        currentBatchData: batchData,
-        generatedCombinations: Array.from(generatedCombinations),
-        timestamp: Date.now(),
-      }
-      setExportSession(updatedSession)
+      setExportSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "ready",
+              currentBatchData: batchData,
+              generatedCombinations: Array.from(generatedCombinations),
+              quotas: { ...quotasRef.current },
+              pairUsage: { ...pairUsageRef.current },
+              timestamp: Date.now(),
+            }
+          : prev,
+      )
 
       toast({
         title: "Batch Ready",
-        description: `Batch ${nextBatchNumber} generated successfully with ${combinations.length} unique NFTs!`,
+        description: `Batch ${currentBatch + 1} generated successfully with ${combinations.length} unique NFTs! (NFTs ${startingNumber}-${startingNumber + combinations.length - 1})`,
       })
 
-      // Auto-download if enabled
       if (autoDownload) {
         setTimeout(() => {
           downloadBatch(batchData)
-        }, 1000) // 1 second delay before auto-download
+        }, 1000)
       }
     } catch (error) {
-      if (error instanceof Error && error.message === "Generation cancelled") {
-        console.log("Batch generation was cancelled")
-        return
-      }
-
+      if (error instanceof Error && error.message === "Generation cancelled") return
       console.error("Batch generation error:", error)
       toast({
         title: "Error",
-        description: `Failed to generate batch ${nextBatchNumber}: ${error}`,
+        description: `Failed to generate batch ${currentBatch + 1}.`,
         variant: "destructive",
       })
       setBatchExportMode(false)
       clearExportSession()
     } finally {
       abortControllerRef.current = null
+      isGeneratingRef.current = false
     }
   }
 
@@ -1767,22 +1843,24 @@ IPFS Instructions:
       return
     }
 
-    const totalPossibleCombinations = layers.reduce((total, layer) => total * layer.items.length, 1)
-
+    const totalPossibleCombinations = layers.reduce((total, layer) => total * Math.max(1, layer.items.length), 1)
     if (exportCount > totalPossibleCombinations) {
       toast({
         title: "Warning",
         description: `Requested ${exportCount} NFTs but only ${totalPossibleCombinations} unique combinations possible. Reducing to maximum possible.`,
-        variant: "destructive",
       })
       exportCount = totalPossibleCombinations
     }
 
-    if (splitIntoMultiple) {
-      // Start batch export mode
-      const numBatches = Math.ceil(exportCount / batchSize)
-      const sessionId = `export-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    const anyExact = layers.some((l) => l.exactCountMode)
+    quotasRef.current = anyExact ? computeInitialQuotas(exportCount) : {}
+    pairUsageRef.current = {}
+    isGeneratingRef.current = false
+    isDownloadingRef.current = false
 
+    if (splitIntoMultiple) {
+      const numBatches = Math.ceil(exportCount / batchSize)
+      const sessionId = `export-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
       const newExportConfig = {
         totalCount: exportCount,
         batchSize,
@@ -1805,6 +1883,8 @@ IPFS Instructions:
         timestamp: Date.now(),
         status: "generating",
         autoDownload: false,
+        quotas: { ...quotasRef.current },
+        pairUsage: { ...pairUsageRef.current },
       }
 
       setExportConfig(newExportConfig)
@@ -1818,13 +1898,9 @@ IPFS Instructions:
       setExportCancelled(false)
       setProgressDetails("Starting first batch generation...")
 
-      console.log(`Starting batch export: ${exportCount} NFTs in ${numBatches} batches of ${batchSize} each`)
-
-      // Create abort controller for first batch
       const abortController = new AbortController()
       abortControllerRef.current = abortController
 
-      // Generate first batch
       try {
         const firstBatchSize = Math.min(batchSize, exportCount)
         const combinations = await generateBatchCombinations(firstBatchSize, useRules, abortController.signal)
@@ -1832,7 +1908,8 @@ IPFS Instructions:
         if (combinations.length === 0) {
           toast({
             title: "Error",
-            description: "Could not generate enough unique combinations for first batch",
+            description:
+              "Could not generate enough unique combinations for first batch with current rules/quotas. Adjust and try again.",
             variant: "destructive",
           })
           setBatchExportMode(false)
@@ -1844,7 +1921,7 @@ IPFS Instructions:
           combinations,
           batchNumber: 1,
           collectionName,
-          imageSize,
+          imageSize: imageSize,
           startingNumber: 1,
         }
 
@@ -1853,29 +1930,30 @@ IPFS Instructions:
         setExportProgress(100)
         setProgressDetails("First batch ready for download")
 
-        // Update session with first batch data
-        const updatedSession: ExportSession = {
-          ...newExportSession,
-          status: "ready",
-          currentBatchData: batchData,
-          generatedCombinations: Array.from(generatedCombinations),
-        }
-        setExportSession(updatedSession)
+        setExportSession((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "ready",
+                currentBatchData: batchData,
+                generatedCombinations: Array.from(generatedCombinations),
+                quotas: { ...quotasRef.current },
+                pairUsage: { ...pairUsageRef.current },
+                timestamp: Date.now(),
+              }
+            : prev,
+        )
 
         toast({
           title: "First Batch Ready",
           description: `Batch 1 generated successfully with ${combinations.length} unique NFTs!`,
         })
       } catch (error) {
-        if (error instanceof Error && error.message === "Generation cancelled") {
-          console.log("First batch generation was cancelled")
-          return
-        }
-
+        if (error instanceof Error && error.message === "Generation cancelled") return
         console.error("First batch generation error:", error)
         toast({
           title: "Error",
-          description: `Failed to generate first batch: ${error}`,
+          description: `Failed to generate first batch.`,
           variant: "destructive",
         })
         setBatchExportMode(false)
@@ -1884,7 +1962,7 @@ IPFS Instructions:
         abortControllerRef.current = null
       }
     } else {
-      // Single export mode (existing functionality)
+      // Single export mode
       setIsExporting(true)
       setExportCancelled(false)
       setExportProgress(0)
@@ -1896,7 +1974,7 @@ IPFS Instructions:
         console.error("Export error:", error)
         toast({
           title: "Error",
-          description: "Error generating collection: " + (error as Error).message,
+          description: "Error generating collection.",
           variant: "destructive",
         })
       } finally {
@@ -1914,14 +1992,15 @@ IPFS Instructions:
     useRules: boolean,
     batchSize: number,
   ) => {
+    const anyExact = layers.some((l) => l.exactCountMode)
+    quotasRef.current = anyExact ? computeInitialQuotas(exportCount) : {}
+    pairUsageRef.current = {}
+
     const { default: JSZip } = await import("jszip")
     const zip = new JSZip()
     const imagesFolder = zip.folder("images")
     const metadataFolder = zip.folder("metadata")
 
-    console.log(`Starting export of ${exportCount} NFTs`)
-
-    // Create abort controller
     const abortController = new AbortController()
     abortControllerRef.current = abortController
 
@@ -1975,7 +2054,7 @@ IPFS Instructions:
           }
 
           const blob = await new Promise<Blob>((resolve) => {
-            canvas.toBlob((blob) => resolve(blob!), "image/png", 0.8) // Reduced quality for speed
+            canvas.toBlob((blob) => resolve(blob!), "image/png", 0.8)
           })
 
           imagesFolder?.file(`${i + 1}.png`, blob)
@@ -2008,53 +2087,31 @@ IPFS Instructions:
         }
       }
 
-      if (!abortController.signal.aborted) {
-        setExportProgress(96)
-        setProgressDetails("Preparing ZIP file...")
+      setExportProgress(98)
+      setProgressDetails("Creating ZIP file...")
 
-        zip.file(
-          "README.txt",
-          `NFT Collection: ${collectionName}
-Generated on: ${new Date().toLocaleString()}
-Total NFTs: ${allCombinations.length}
-Image Size: ${imageSize}x${imageSize}px
+      const zipContent = await zip.generateAsync({
+        type: "blob",
+        compression: "STORE",
+        streamFiles: false,
+      })
 
-⚠️ IMPORTANT: All NFTs in this collection are guaranteed to be unique.
+      setExportProgress(100)
+      setProgressDetails("Starting download...")
 
-IPFS Instructions:
-1. Upload the 'images' folder to IPFS
-2. Get the CID (hash) from IPFS for the images folder
-3. Replace [CID] in ALL metadata JSON files with your actual images CID
-4. Upload the 'metadata' folder to IPFS
-5. Use the metadata folder CID for your NFT contract`,
-        )
+      const url = URL.createObjectURL(zipContent)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `${collectionName.toLowerCase().replace(/\s+/g, "-")}.zip`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
 
-        setExportProgress(98)
-        setProgressDetails("Creating ZIP file...")
-
-        const zipContent = await zip.generateAsync({
-          type: "blob",
-          compression: "STORE", // No compression for speed
-          streamFiles: false, // Disable streaming for faster generation
-        })
-
-        setExportProgress(100)
-        setProgressDetails("Starting download...")
-
-        const url = URL.createObjectURL(zipContent)
-        const a = document.createElement("a")
-        a.href = url
-        a.download = `${collectionName.toLowerCase().replace(/\s+/g, "-")}.zip`
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-        setTimeout(() => URL.revokeObjectURL(url), 1000)
-
-        toast({
-          title: "Success",
-          description: `Collection with ${allCombinations.length} unique NFTs exported successfully!`,
-        })
-      }
+      toast({
+        title: "Success",
+        description: `Collection with ${allCombinations.length} unique NFTs exported successfully!`,
+      })
     } finally {
       abortControllerRef.current = null
     }
@@ -2062,18 +2119,13 @@ IPFS Instructions:
 
   const cancelExport = () => {
     setExportCancelled(true)
+    if (abortControllerRef.current) abortControllerRef.current.abort()
+    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current)
 
-    // Cancel any ongoing operations
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort()
-    }
+    // Reset flags
+    isGeneratingRef.current = false
+    isDownloadingRef.current = false
 
-    // Clear intervals
-    if (progressIntervalRef.current) {
-      clearInterval(progressIntervalRef.current)
-    }
-
-    // Reset states
     setIsExporting(false)
     setBatchExportMode(false)
     setCurrentBatchData(null)
@@ -2086,7 +2138,6 @@ IPFS Instructions:
     setProgressDetails("")
     setAutoDownload(false)
 
-    // Clear session
     clearExportSession()
     setExportSession(null)
 
@@ -2119,7 +2170,6 @@ IPFS Instructions:
           description: `Batch ${currentBatch} is ready for download`,
         })
       } else {
-        // Resume generation
         generateNextBatch()
       }
     }
@@ -2141,7 +2191,7 @@ IPFS Instructions:
     })
   }, [toast])
 
-  // Project management functions
+  // Project management
   const exportProject = useCallback(() => {
     if (layers.length === 0) {
       toast({
@@ -2210,7 +2260,6 @@ IPFS Instructions:
           }
           const projectState: ProjectState = JSON.parse(text)
 
-          // Validate the imported data
           if (
             !projectState.layers ||
             !projectState.traitMatchingRules ||
@@ -2232,7 +2281,6 @@ IPFS Instructions:
           setNextExclusionId(projectState.nextExclusionId || Date.now())
           setNextMappingId(projectState.nextMappingId || Date.now())
 
-          // Clear any existing selections
           setSelectedItems({})
 
           toast({
@@ -2247,7 +2295,6 @@ IPFS Instructions:
             variant: "destructive",
           })
         } finally {
-          // Reset file input to allow importing the same file again
           if (event.target) {
             event.target.value = ""
           }
@@ -2258,15 +2305,18 @@ IPFS Instructions:
     [toast],
   )
 
+  const getLayerCountsSum = (layer: Layer) =>
+    layer.items.reduce((s, it) => s + Math.max(0, Math.floor(it.count || 0)), 0)
+
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-6">
       <div className="max-w-6xl mx-auto space-y-6">
         <div className="text-center">
           <h1 className="text-4xl font-bold text-purple-400 mb-2">NFT Layer Viewer</h1>
-          <p className="text-gray-400">Enhanced with persistent sessions and optimized batch processing</p>
+          <p className="text-gray-400">Enhanced matching with consistent rule application and balanced coverage</p>
         </div>
 
-        {/* Session Recovery Card */}
+        {/* Session Recovery */}
         {exportSession && batchStatus === "paused" && (
           <Card className="bg-yellow-900/20 border-yellow-500/30">
             <CardHeader>
@@ -2302,6 +2352,7 @@ IPFS Instructions:
           </Card>
         )}
 
+        {/* Project Management */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-yellow-400">Project Management</CardTitle>
@@ -2320,6 +2371,7 @@ IPFS Instructions:
           </CardContent>
         </Card>
 
+        {/* Upload */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-purple-400">Step 1: Upload Layer Images</CardTitle>
@@ -2357,10 +2409,13 @@ IPFS Instructions:
           </CardContent>
         </Card>
 
+        {/* Manage Layers */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-purple-400">Step 2: Manage Layers & Layer Order</CardTitle>
-            <CardDescription>Organize your layers and set their stacking order</CardDescription>
+            <CardDescription>
+              Organize layers, set stacking order, and configure rarity vs exact numbers
+            </CardDescription>
           </CardHeader>
           <CardContent>
             {layers.length === 0 ? (
@@ -2375,35 +2430,40 @@ IPFS Instructions:
                 </div>
 
                 {layers
-                  .sort((a, b) => b.zIndex - a.zIndex) // Sort by z-index descending (top to bottom)
-                  .map((layer, visualIndex) => {
+                  .sort((a, b) => b.zIndex - a.zIndex)
+                  .map((layer) => {
                     const isTopLayer = layer.zIndex === Math.max(...layers.map((l) => l.zIndex))
                     const isBottomLayer = layer.zIndex === Math.min(...layers.map((l) => l.zIndex))
+                    const countsSum = getLayerCountsSum(layer)
+                    const exportTotal = exportConfig?.totalCount
+
+                    const countsStatus =
+                      exportTotal !== undefined
+                        ? countsSum === exportTotal
+                          ? { text: "Counts match export size", cls: "text-green-400" }
+                          : { text: `Counts: ${countsSum} / Export: ${exportTotal}`, cls: "text-yellow-400" }
+                        : { text: `Counts total: ${countsSum}`, cls: "text-gray-300" }
 
                     return (
                       <Card
                         key={layer.id}
-                        className={`
-              bg-gray-700 border-gray-600 transition-all duration-200
-              ${isTopLayer ? "ring-2 ring-green-500 bg-green-900/20" : ""}
-              ${isBottomLayer ? "ring-2 ring-orange-500 bg-orange-900/20" : ""}
-              ${!isTopLayer && !isBottomLayer ? "hover:bg-gray-600" : ""}
-            `}
+                        className={`bg-gray-700 border-gray-600 transition-all duration-200 ${
+                          isTopLayer ? "ring-2 ring-green-500 bg-green-900/20" : ""
+                        } ${isBottomLayer ? "ring-2 ring-orange-500 bg-orange-900/20" : ""} ${
+                          !isTopLayer && !isBottomLayer ? "hover:bg-gray-600" : ""
+                        }`}
                       >
                         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                           <div className="flex items-center space-x-3">
                             <div className="flex flex-col items-center">
                               <div
-                                className={`
-                    w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold
-                    ${
-                      isTopLayer
-                        ? "bg-green-500 text-white"
-                        : isBottomLayer
-                          ? "bg-orange-500 text-white"
-                          : "bg-blue-500 text-white"
-                    }
-                  `}
+                                className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${
+                                  isTopLayer
+                                    ? "bg-green-500 text-white"
+                                    : isBottomLayer
+                                      ? "bg-orange-500 text-white"
+                                      : "bg-blue-500 text-white"
+                                }`}
                               >
                                 {layer.zIndex}
                               </div>
@@ -2421,10 +2481,10 @@ IPFS Instructions:
                                 {layer.name}
                               </CardTitle>
                               <div className="text-xs text-gray-400">
-                                {layer.items.length} items • Z-Index: {layer.zIndex}
-                                {isTopLayer && " • Renders on top"}
-                                {isBottomLayer && " • Renders behind"}
+                                {layer.items.length} items • Z-Index: {layer.zIndex}{" "}
+                                {layer.exactCountMode ? "• Exact Numbers ON" : "• Weighted %"}
                               </div>
+                              <div className={`text-xs ${countsStatus.cls}`}>{countsStatus.text}</div>
                             </div>
                           </div>
 
@@ -2434,23 +2494,21 @@ IPFS Instructions:
                                 size="sm"
                                 onClick={() => moveLayer(layer.id, "up")}
                                 disabled={isTopLayer}
-                                className={`
-                      h-6 px-2 text-xs
-                      ${isTopLayer ? "opacity-50 cursor-not-allowed" : "hover:bg-green-600"}
-                    `}
+                                className={`h-6 px-2 text-xs ${
+                                  isTopLayer ? "opacity-50 cursor-not-allowed" : "hover:bg-green-600"
+                                }`}
                               >
-                                ↑ Up
+                                {"↑ Up"}
                               </Button>
                               <Button
                                 size="sm"
                                 onClick={() => moveLayer(layer.id, "down")}
                                 disabled={isBottomLayer}
-                                className={`
-                      h-6 px-2 text-xs
-                      ${isBottomLayer ? "opacity-50 cursor-not-allowed" : "hover:bg-orange-600"}
-                    `}
+                                className={`h-6 px-2 text-xs ${
+                                  isBottomLayer ? "opacity-50 cursor-not-allowed" : "hover:bg-orange-600"
+                                }`}
                               >
-                                ↓ Down
+                                {"↓ Down"}
                               </Button>
                             </div>
                             <Button size="sm" variant="destructive" onClick={() => removeLayer(layer.id)}>
@@ -2459,126 +2517,208 @@ IPFS Instructions:
                           </div>
                         </CardHeader>
                         <CardContent>
-                          <div className="flex items-center space-x-4">
-                            <Label htmlFor={`rarityMode-${layer.id}`}>Rarity Mode:</Label>
-                            <Select
-                              value={rarityMode}
-                              onValueChange={(value: "equal" | "weighted") => setRarityMode(value)}
-                            >
-                              <SelectTrigger className="w-32">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="equal">Equal</SelectItem>
-                                <SelectItem value="weighted">Weighted</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          </div>
+                          <Tabs
+                            value={layer.exactCountMode ? "counts" : "weighted"}
+                            onValueChange={(val) => setLayerExactMode(layer.id, val === "counts")}
+                            className="mt-2"
+                          >
+                            <TabsList className="mb-3">
+                              <TabsTrigger value="weighted">Weighted %</TabsTrigger>
+                              <TabsTrigger value="counts">Exact Numbers</TabsTrigger>
+                            </TabsList>
 
-                          {rarityMode === "weighted" && (
-                            <div className="space-y-4 mt-4">
-                              <div className="flex items-center justify-between">
-                                <Label className="text-lg font-semibold">Individual Trait Rarities</Label>
-                                <div className="flex space-x-2">
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    onClick={() => applyRarityPreset(layer.id, "Equal Distribution")}
-                                  >
-                                    Equal
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    onClick={() => applyRarityPreset(layer.id, "Common/Rare (80/20)")}
-                                  >
-                                    80/20
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    onClick={() => applyRarityPreset(layer.id, "Pyramid (50/30/15/5)")}
-                                  >
-                                    Pyramid
-                                  </Button>
-                                  <Button size="sm" onClick={() => normalizeRarities(layer.id)}>
-                                    Normalize to 100%
-                                  </Button>
-                                </div>
+                            <TabsContent value="weighted">
+                              <div className="flex items-center space-x-4 mb-4">
+                                <Label htmlFor={`rarityMode-${layer.id}`}>Rarity Mode:</Label>
+                                <Select
+                                  value={rarityMode}
+                                  onValueChange={(value: "equal" | "weighted") => setRarityMode(value)}
+                                >
+                                  <SelectTrigger className="w-32">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="equal">Equal</SelectItem>
+                                    <SelectItem value="weighted">Weighted</SelectItem>
+                                  </SelectContent>
+                                </Select>
                               </div>
 
-                              <div className="bg-gray-600 rounded-lg p-4">
-                                <div className="grid grid-cols-1 gap-3">
-                                  {layer.items.map((item) => {
-                                    const rarity = item.rarity || 0
-                                    const rarityCategory =
-                                      rarity < 5
-                                        ? { name: "Ultra Rare", color: "bg-red-500", textColor: "text-red-400" }
-                                        : rarity < 15
-                                          ? { name: "Rare", color: "bg-purple-500", textColor: "text-purple-400" }
-                                          : rarity < 30
-                                            ? { name: "Uncommon", color: "bg-blue-500", textColor: "text-blue-400" }
-                                            : { name: "Common", color: "bg-gray-500", textColor: "text-gray-400" }
-
-                                    return (
-                                      <div
-                                        key={item.id}
-                                        className="flex items-center justify-between p-3 bg-gray-700 rounded"
+                              {rarityMode === "weighted" && (
+                                <div className="space-y-4">
+                                  <div className="flex items-center justify-between">
+                                    <Label className="text-lg font-semibold">Individual Trait Rarities</Label>
+                                    <div className="flex space-x-2">
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => applyRarityPreset(layer.id, "Equal Distribution")}
                                       >
-                                        <div className="flex items-center space-x-3">
-                                          <div className="font-medium text-white">{item.name}</div>
+                                        Equal
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => applyRarityPreset(layer.id, "Common/Rare (80/20)")}
+                                      >
+                                        80/20
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => applyRarityPreset(layer.id, "Pyramid (50/30/15/5)")}
+                                      >
+                                        Pyramid
+                                      </Button>
+                                      <Button size="sm" onClick={() => normalizeRarities(layer.id)}>
+                                        Normalize to 100%
+                                      </Button>
+                                    </div>
+                                  </div>
+
+                                  <div className="bg-gray-600 rounded-lg p-4">
+                                    <div className="grid grid-cols-1 gap-3">
+                                      {layer.items.map((item) => {
+                                        const rarity = item.rarity || 0
+                                        const rarityCategory =
+                                          rarity < 5
+                                            ? { name: "Ultra Rare", color: "bg-red-500" }
+                                            : rarity < 15
+                                              ? { name: "Rare", color: "bg-purple-500" }
+                                              : rarity < 30
+                                                ? { name: "Uncommon", color: "bg-blue-500" }
+                                                : { name: "Common", color: "bg-gray-500" }
+
+                                        return (
                                           <div
-                                            className={`px-2 py-1 rounded text-xs font-semibold ${rarityCategory.color} text-white`}
+                                            key={item.id}
+                                            className="flex items-center justify-between p-3 bg-gray-700 rounded"
                                           >
-                                            {rarityCategory.name}
+                                            <div className="flex items-center space-x-3">
+                                              <div className="font-medium text-white">{item.name}</div>
+                                              <div
+                                                className={`px-2 py-1 rounded text-xs font-semibold ${rarityCategory.color} text-white`}
+                                              >
+                                                {rarityCategory.name}
+                                              </div>
+                                            </div>
+                                            <div className="flex items-center space-x-2">
+                                              <Input
+                                                type="number"
+                                                className="w-20 text-center"
+                                                value={(rarity || 0).toFixed(1)}
+                                                min={0}
+                                                max={100}
+                                                step={0.1}
+                                                onChange={(e) => {
+                                                  const newRarity = Number.parseFloat(e.target.value) || 0
+                                                  if (newRarity >= 0 && newRarity <= 100) {
+                                                    updateItemRarity(layer.id, item.id, newRarity)
+                                                  }
+                                                }}
+                                              />
+                                              <span className="text-sm text-gray-300">%</span>
+                                            </div>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+
+                                    <div className="mt-4 p-3 bg-gray-800 rounded">
+                                      <div className="flex justify-between items-center">
+                                        <span className="text-sm font-medium">Total Percentage:</span>
+                                        <span
+                                          className={`font-bold ${
+                                            Math.abs(
+                                              layer.items.reduce((sum, item) => sum + (item.rarity || 0), 0) - 100,
+                                            ) < 0.1
+                                              ? "text-green-400"
+                                              : "text-red-400"
+                                          }`}
+                                        >
+                                          {layer.items.reduce((sum, item) => sum + (item.rarity || 0), 0).toFixed(1)}%
+                                        </span>
+                                      </div>
+                                      {Math.abs(layer.items.reduce((sum, item) => sum + (item.rarity || 0), 0) - 100) >=
+                                        0.1 && (
+                                        <p className="text-xs text-red-400 mt-1">
+                                          {"⚠️ Total should equal 100% for accurate rarity distribution"}
+                                        </p>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </TabsContent>
+
+                            <TabsContent value="counts">
+                              <div className="space-y-4">
+                                <div className="p-3 bg-gray-800 rounded">
+                                  <div className="text-sm">
+                                    Enter exact numbers per trait for the entire collection. For example, for a HEAD
+                                    layer with 3 races, you can set Race A = 500, Race B = 300, Race C = 200 for a 1000
+                                    NFT collection.
+                                  </div>
+                                  <div className="mt-2 text-sm">
+                                    Total for this layer: <span className="font-semibold">{countsSum}</span>
+                                    {exportConfig?.totalCount !== undefined && (
+                                      <>
+                                        {" "}
+                                        • Planned Export:{" "}
+                                        <span className="font-semibold">{exportConfig.totalCount}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="bg-gray-600 rounded-lg p-4">
+                                  <div className="grid grid-cols-1 gap-3">
+                                    {layer.items.map((item) => {
+                                      const count = Math.max(0, Math.floor(item.count || 0))
+                                      return (
+                                        <div
+                                          key={item.id}
+                                          className="flex items-center justify-between p-3 bg-gray-700 rounded"
+                                        >
+                                          <div className="flex items-center space-x-3">
+                                            <div className="font-medium text-white">{item.name}</div>
+                                          </div>
+                                          <div className="flex items-center space-x-2">
+                                            <Input
+                                              type="number"
+                                              className="w-24 text-center"
+                                              value={count}
+                                              min={0}
+                                              step={1}
+                                              onChange={(e) =>
+                                                updateItemCount(layer.id, item.id, Number.parseInt(e.target.value) || 0)
+                                              }
+                                            />
+                                            <span className="text-sm text-gray-300">count</span>
                                           </div>
                                         </div>
-                                        <div className="flex items-center space-x-2">
-                                          <Input
-                                            type="number"
-                                            className="w-20 text-center"
-                                            value={rarity.toFixed(1)}
-                                            min="0"
-                                            max="100"
-                                            step="0.1"
-                                            onChange={(e) => {
-                                              const newRarity = Number.parseFloat(e.target.value) || 0
-                                              if (newRarity >= 0 && newRarity <= 100) {
-                                                updateItemRarity(layer.id, item.id, newRarity)
-                                              }
-                                            }}
-                                          />
-                                          <span className="text-sm text-gray-400">%</span>
-                                        </div>
-                                      </div>
-                                    )
-                                  })}
-                                </div>
-
-                                <div className="mt-4 p-3 bg-gray-800 rounded">
-                                  <div className="flex justify-between items-center">
-                                    <span className="text-sm font-medium">Total Percentage:</span>
-                                    <span
-                                      className={`font-bold ${
-                                        Math.abs(layer.items.reduce((sum, item) => sum + (item.rarity || 0), 0) - 100) <
-                                        0.1
-                                          ? "text-green-400"
-                                          : "text-red-400"
-                                      }`}
-                                    >
-                                      {layer.items.reduce((sum, item) => sum + (item.rarity || 0), 0).toFixed(1)}%
-                                    </span>
+                                      )
+                                    })}
                                   </div>
-                                  {Math.abs(layer.items.reduce((sum, item) => sum + (item.rarity || 0), 0) - 100) >=
-                                    0.1 && (
-                                    <p className="text-xs text-red-400 mt-1">
-                                      ⚠️ Total should equal 100% for accurate rarity distribution
-                                    </p>
+
+                                  {exportConfig?.totalCount !== undefined && (
+                                    <div className="mt-4 p-3 bg-gray-800 rounded">
+                                      <div className="text-sm">
+                                        {countsSum === exportConfig.totalCount ? (
+                                          <span className="text-green-400">Counts match the export size.</span>
+                                        ) : (
+                                          <span className="text-yellow-300">
+                                            {
+                                              "Counts do not match export size. They will be proportionally scaled when you start export."
+                                            }
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
                                   )}
                                 </div>
                               </div>
-                            </div>
-                          )}
+                            </TabsContent>
+                          </Tabs>
                         </CardContent>
                       </Card>
                     )
@@ -2588,6 +2728,7 @@ IPFS Instructions:
           </CardContent>
         </Card>
 
+        {/* Rules Manager */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-purple-400">Step 3: Trait Matching & Exclusion</CardTitle>
@@ -2601,7 +2742,10 @@ IPFS Instructions:
               manualMappings={manualMappings}
               onAddMatchingRule={addTraitMatchingRule}
               onAddExclusionRule={addTraitExclusionRule}
-              onRemoveExclusionRule={removeTraitExclusionRule}
+              onRemoveExclusionRule={(ruleId) => {
+                setTraitExclusionRules((prev) => prev.filter((rule) => rule.id !== ruleId))
+                toast({ title: "Success", description: "Exclusion rule removed" })
+              }}
               onRemoveMatchingRule={(ruleId) => {
                 setTraitMatchingRules((prev) => prev.filter((rule) => rule.id !== ruleId))
                 toast({ title: "Success", description: "Matching rule removed" })
@@ -2612,6 +2756,7 @@ IPFS Instructions:
           </CardContent>
         </Card>
 
+        {/* Preview */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-purple-400">Step 4: Preview</CardTitle>
@@ -2621,7 +2766,7 @@ IPFS Instructions:
             <NFTPreview
               layers={layers}
               selectedItems={selectedItems}
-              onSelectionChange={setSelectedItems}
+              onSelectionChange={handleSelectionChange}
               onGenerateRandom={generateRandom}
               onGenerateWithRules={generateWithRules}
               onCalculateUniqueness={calculateUniqueness}
@@ -2631,6 +2776,7 @@ IPFS Instructions:
           </CardContent>
         </Card>
 
+        {/* Trait Usage */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-purple-400">Step 4.5: Trait Usage Balance</CardTitle>
@@ -2643,6 +2789,7 @@ IPFS Instructions:
 
         {rarityMode === "weighted" && <RarityAnalysis layers={layers} rarityMode={rarityMode} />}
 
+        {/* Export */}
         <Card className="bg-gray-800 border-gray-700">
           <CardHeader>
             <CardTitle className="text-purple-400">Step 5: Export Collection</CardTitle>

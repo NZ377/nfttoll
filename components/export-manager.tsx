@@ -69,8 +69,8 @@ export function ExportManager({
     onExport(exportCount, collectionName, imageSize, useRules, batchSize, splitIntoMultiple)
   }
 
-  const showSplitOption = exportCount > 25 // Changed from 50
-  const showWarning = exportCount >= 100 && !splitIntoMultiple // Changed from 200
+  const showSplitOption = exportCount > 25
+  const showWarning = exportCount >= 100 && !splitIntoMultiple
 
   const getBatchStatusColor = (status: string) => {
     switch (status) {
@@ -151,8 +151,8 @@ export function ExportManager({
           <Input
             id="export-count"
             type="number"
-            min="1"
-            max="10000"
+            min={1}
+            max={10000}
             value={exportCount}
             onChange={(e) => setExportCount(Number.parseInt(e.target.value) || 1)}
             className="bg-gray-600 border-gray-500"
@@ -272,7 +272,6 @@ export function ExportManager({
               <Progress value={(completedBatches.length / totalBatches) * 100} className="h-2" />
             </div>
 
-            {/* Current Batch Status */}
             <div className="p-4 bg-gray-800 rounded-lg">
               <div className="flex items-center justify-between mb-3">
                 <h4 className="font-semibold">
@@ -283,7 +282,7 @@ export function ExportManager({
                 </span>
               </div>
 
-              {/* Current Batch Progress */}
+              {/* Generating */}
               {batchStatus === "generating" && (
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
@@ -291,10 +290,15 @@ export function ExportManager({
                     <span>{exportProgress}%</span>
                   </div>
                   <Progress value={exportProgress} className="h-2" />
+                  <div className="flex justify-center">
+                    <Button onClick={onCancel} variant="destructive" size="sm">
+                      Cancel Generation
+                    </Button>
+                  </div>
                 </div>
               )}
 
-              {/* Batch Ready for Download */}
+              {/* Ready */}
               {batchStatus === "ready" && (
                 <div className="space-y-3">
                   <div className="flex items-center space-x-2 text-green-400">
@@ -324,10 +328,15 @@ export function ExportManager({
                   </div>
                   <Progress value={exportProgress} className="h-2" />
                   <div className="text-xs text-gray-400 text-center">{exportProgress}% complete</div>
+                  <div className="flex justify-center">
+                    <Button onClick={onCancel} variant="destructive" size="sm">
+                      Cancel Download
+                    </Button>
+                  </div>
                 </div>
               )}
 
-              {/* Batch Completed */}
+              {/* Completed */}
               {batchStatus === "completed" && currentBatch < totalBatches && (
                 <div className="space-y-3">
                   <div className="flex items-center space-x-2 text-green-400">
@@ -355,7 +364,7 @@ export function ExportManager({
                 </div>
               )}
 
-              {/* All Batches Completed */}
+              {/* All Completed */}
               {batchStatus === "completed" && currentBatch >= totalBatches && (
                 <div className="text-center space-y-2">
                   <div className="flex items-center justify-center space-x-2 text-green-400">
